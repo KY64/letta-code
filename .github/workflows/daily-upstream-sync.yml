@@ -1,0 +1,27 @@
+name: Daily Upstream Sync
+
+on:
+  schedule:
+    - cron: "0 9 * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    if: github.repository != 'letta-ai/letta-code'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@v6
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Merge upstream main into fork main
+        run: |
+          git remote add upstream https://github.com/letta-ai/letta-code.git
+          git fetch upstream main
+          git merge upstream/main --no-edit
+          git push origin main
