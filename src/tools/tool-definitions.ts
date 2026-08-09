@@ -6,6 +6,7 @@ import BashOutputDescription from "./descriptions/BashOutput.md";
 import EditDescription from "./descriptions/Edit.md";
 import EnterWorktreeDescription from "./descriptions/EnterWorktree.md";
 import ExecCommandDescription from "./descriptions/ExecCommand.md";
+import ExitWorktreeDescription from "./descriptions/ExitWorktree.md";
 import GlobDescription from "./descriptions/Glob.md";
 // Gemini toolset
 import GlobGeminiDescription from "./descriptions/GlobGemini.md";
@@ -17,6 +18,7 @@ import ListDirectoryGeminiDescription from "./descriptions/ListDirectoryGemini.m
 import LSDescription from "./descriptions/LS.md";
 import MemoryDescription from "./descriptions/Memory.md";
 import MemoryApplyPatchDescription from "./descriptions/MemoryApplyPatch.md";
+import MonitorDescription from "./descriptions/Monitor.md";
 import MultiEditDescription from "./descriptions/MultiEdit.md";
 import ReadDescription from "./descriptions/Read.md";
 import ReadArtifactFileDescription from "./descriptions/ReadArtifactFile.md";
@@ -53,6 +55,7 @@ import { bash_output } from "./impl/bash-output";
 import { edit } from "./impl/edit";
 import { enter_worktree } from "./impl/enter-worktree";
 import { exec_command, write_stdin } from "./impl/exec-command";
+import { exit_worktree } from "./impl/exit-worktree";
 import { glob } from "./impl/glob";
 // Gemini toolset
 import { glob_gemini } from "./impl/glob-gemini";
@@ -64,6 +67,7 @@ import { list_directory } from "./impl/list-directory-gemini";
 import { ls } from "./impl/ls";
 import { memory } from "./impl/memory";
 import { memory_apply_patch } from "./impl/memory-apply-patch";
+import { monitor } from "./impl/monitor";
 import { multi_edit } from "./impl/multi-edit";
 import { read } from "./impl/read";
 import { read_file } from "./impl/read-file-codex";
@@ -97,6 +101,7 @@ import BashOutputSchema from "./schemas/BashOutput.json";
 import EditSchema from "./schemas/Edit.json";
 import EnterWorktreeSchema from "./schemas/EnterWorktree.json";
 import ExecCommandSchema from "./schemas/ExecCommand.json";
+import ExitWorktreeSchema from "./schemas/ExitWorktree.json";
 import GlobSchema from "./schemas/Glob.json";
 // Gemini toolset
 import GlobGeminiSchema from "./schemas/GlobGemini.json";
@@ -108,6 +113,7 @@ import ListDirectoryGeminiSchema from "./schemas/ListDirectoryGemini.json";
 import LSSchema from "./schemas/LS.json";
 import MemorySchema from "./schemas/Memory.json";
 import MemoryApplyPatchSchema from "./schemas/MemoryApplyPatch.json";
+import MonitorSchema from "./schemas/Monitor.json";
 import MultiEditSchema from "./schemas/MultiEdit.json";
 import ReadSchema from "./schemas/Read.json";
 import ReadArtifactFileSchema from "./schemas/ReadArtifactFile.json";
@@ -185,6 +191,11 @@ const toolDefinitions = {
     description: EnterWorktreeDescription.trim(),
     impl: enter_worktree,
   }),
+  ExitWorktree: defineTool({
+    schema: ExitWorktreeSchema,
+    description: ExitWorktreeDescription.trim(),
+    impl: exit_worktree,
+  }),
   Edit: defineTool({
     schema: EditSchema,
     description: EditDescription.trim(),
@@ -229,6 +240,11 @@ const toolDefinitions = {
     schema: MemoryApplyPatchSchema,
     description: MemoryApplyPatchDescription.trim(),
     impl: memory_apply_patch,
+  }),
+  Monitor: defineTool({
+    schema: MonitorSchema,
+    description: MonitorDescription.trim(),
+    impl: monitor,
   }),
   MultiEdit: defineTool({
     schema: MultiEditSchema,

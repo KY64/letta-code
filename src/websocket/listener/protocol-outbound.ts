@@ -43,7 +43,7 @@ import {
   shouldEmitDeviceStatus,
 } from "./device-status-cache";
 import { SUPPORTED_REMOTE_COMMANDS } from "./listener-constants";
-import { listListenerModCommands } from "./mod-commands";
+import { listListenerModCommands } from "./mod-command-registry";
 import { enqueueOutboundFrame, type OutboundFrameClass } from "./outbound-wire";
 import { getConversationPermissionModeState } from "./permission-mode";
 import {
@@ -201,46 +201,46 @@ export function buildDeviceStatus(
     };
   }
   const scope = getScopeForRuntime(runtime, params);
-  const scopedAgentId = resolveScopedAgentId(listener, scope);
-  const scopedConversationId = resolveScopedConversationId(listener, scope);
+  const agentId = resolveScopedAgentId(listener, scope);
+  const conversationId = resolveScopedConversationId(listener, scope);
   const conversationRuntime = getConversationRuntime(
     listener,
-    scopedAgentId,
-    scopedConversationId,
+    agentId,
+    conversationId,
   );
   const toolsetPreference = (() => {
-    if (!scopedAgentId) {
+    if (!agentId) {
       return "auto" as const;
     }
     try {
-      return settingsManager.getToolsetPreference(scopedAgentId);
+      return settingsManager.getToolsetPreference(agentId, conversationId);
     } catch {
       return "auto" as const;
     }
   })();
   const conversationPermissionModeState = getConversationPermissionModeState(
     listener,
-    scopedAgentId,
-    scopedConversationId,
+    agentId,
+    conversationId,
   );
   const interruptedCacheActive = hasInterruptedCacheForScope(listener, scope);
   const resolvedCwd = getConversationWorkingDirectory(
     listener,
-    scopedAgentId,
-    scopedConversationId,
+    agentId,
+    conversationId,
   );
   const reflectionSettings = (() => {
-    if (!scopedAgentId) {
+    if (!agentId) {
       return null;
     }
     try {
-      return getReflectionSettings(scopedAgentId, resolvedCwd);
+      return getReflectionSettings(agentId, resolvedCwd);
     } catch {
       return null;
     }
   })();
-  const systemPromptDoctorState = scopedAgentId
-    ? getSystemPromptDoctorState(scopedAgentId)
+  const systemPromptDoctorState = agentId
+    ? getSystemPromptDoctorState(agentId)
     : null;
   const transport = listener.transport ?? listener.socket;
   return {
@@ -256,20 +256,20 @@ export function buildDeviceStatus(
       conversationRuntime?.currentToolset ??
       (toolsetPreference === "auto" ? null : toolsetPreference),
     current_toolset_preference:
-      conversationRuntime?.currentToolsetPreference ?? toolsetPreference,
+      conversationRuntime?.currentToolset === null
+        ? toolsetPreference
+        : (conversationRuntime?.currentToolsetPreference ?? toolsetPreference),
     current_loaded_tools: conversationRuntime?.currentLoadedTools ?? [],
     current_available_skills: conversationRuntime?.currentAvailableSkills ?? [],
     background_processes: buildBackgroundProcessSnapshot(
-      scopedAgentId,
-      scopedConversationId,
+      agentId,
+      conversationId,
     ),
     pending_control_requests: interruptedCacheActive
       ? []
       : getPendingControlRequests(listener, scope),
     experiments: experimentManager.list(),
-    memory_directory: scopedAgentId
-      ? getScopedMemoryFilesystemRoot(scopedAgentId)
-      : null,
+    memory_directory: agentId ? getScopedMemoryFilesystemRoot(agentId) : null,
     ...(params === undefined
       ? {
           cwd_map: getExportedCwdMap(listener),
@@ -279,10 +279,10 @@ export function buildDeviceStatus(
     cwd_revision: listener.workingDirectoryRevision ?? 0,
     should_doctor: systemPromptDoctorState?.should_doctor ?? false,
     supported_commands: FROZEN_SUPPORTED_COMMANDS,
-    ...buildModCommandsField(listener, scopedAgentId),
-    reflection_settings: scopedAgentId
+    ...buildModCommandsField(listener, agentId),
+    reflection_settings: agentId
       ? {
-          agent_id: scopedAgentId,
+          agent_id: agentId,
           trigger: reflectionSettings?.trigger ?? "compaction-event",
           step_count: reflectionSettings?.stepCount ?? 25,
           merge: reflectionSettings?.merge ?? "auto",
