@@ -3,6 +3,7 @@ import type {
   MessageCreate,
 } from "@letta-ai/letta-client/resources/agents/agents";
 import type { ApprovalCreate } from "@letta-ai/letta-client/resources/agents/messages";
+import { buildClientSkillsPayload } from "@/agent/client-skills";
 import {
   setConversationId,
   setCurrentAgentId,
@@ -16,15 +17,24 @@ import {
 } from "@/reminders/engine";
 import { buildListenReminderContext } from "@/reminders/listen-context";
 import { trackBoundaryError } from "@/telemetry/error-reporting";
+import { INTERACTIVE_USER_INPUT_TOOL_NAMES } from "@/tools/interactive-policy";
 import { prepareToolExecutionContextForScope } from "@/tools/toolset";
 import { debugWarn, isDebugEnabled } from "@/utils/debug";
-import type { ImageFailureModesByMessageOtid } from "@/utils/message-image-normalization";
 import { detectShellContext } from "@/utils/shell-context";
 import { getInboundImageFailureModes } from "./image-policy";
 import { consumeInterruptQueue } from "./interrupts";
-import { ensureListenerModAdapter } from "./mod-adapter";
+import {
+  createListenerAgentModContext,
+  createListenerModEvents,
+  ensureListenerModAdaptersForAgent,
+} from "./mod-adapter";
 import type { ConversationPermissionModeState } from "./permission-mode";
 import { emitListenerTurnStart } from "./turn-events";
+import {
+  createTurnInputState,
+  ensureTurnInputMessageOtids,
+  type TurnInputState,
+} from "./turn-input-state";
 import type { TurnLease } from "./turn-lifecycle";
 import {
   buildInboundUserTranscriptLines,
@@ -47,11 +57,11 @@ export type ListenerTurnSetupResult =
   | {
       kind: "ready";
       getCachedAgent: () => AgentState | null;
-      currentInput: Array<MessageCreate | ApprovalCreate>;
-      imageFailureModesByMessageOtid?: ImageFailureModesByMessageOtid;
+      turnInput: TurnInputState;
       inboundUserTranscriptLines: Line[];
       pendingNormalizationInterruptedToolCallIds: string[];
       preparedToolContext: PreparedToolContext;
+      overrideModel?: string;
     };
 
 export async function prepareListenerTurn(params: {
@@ -111,26 +121,7 @@ export async function prepareListenerTurn(params: {
     messagesToSend.push(consumed.approvalMessage);
     queuedInterruptedToolCallIds = consumed.interruptedToolCallIds;
   }
-  messagesToSend.push(
-    ...msg.messages.map((message) =>
-      "content" in message && !message.otid
-        ? {
-            ...message,
-            // Reconcile optimistic transcript rows with the canonical echo.
-            otid:
-              "client_message_id" in message &&
-              typeof message.client_message_id === "string"
-                ? message.client_message_id
-                : crypto.randomUUID(),
-          }
-        : message,
-    ),
-  );
-
-  const imageFailureModesByMessageOtid = getInboundImageFailureModes({
-    channelTurnSources: msg.channelTurnSources,
-    messages: messagesToSend,
-  });
+  messagesToSend.push(...ensureTurnInputMessageOtids(msg.messages));
 
   let inboundUserTranscriptLines =
     buildInboundUserTranscriptLines(messagesToSend);
@@ -244,7 +235,7 @@ export async function prepareListenerTurn(params: {
         permissionMode: permissionModeState.mode,
         cachedAgent,
       })
-    : ({ cancelled: false, input: messagesToSend } as const);
+    : ({ cancelled: false, handlerCount: 0, input: messagesToSend } as const);
   if (isInterrupted()) {
     return { kind: "interrupted" };
   }
@@ -252,21 +243,69 @@ export async function prepareListenerTurn(params: {
     return { kind: "cancelled", reason: turnStartEmission.reason };
   }
 
-  const currentInput = turnStartEmission.input;
+  let overrideModel: string | undefined;
+  if (turnStartEmission.handlerCount > 0) {
+    try {
+      const conversation =
+        await getBackend().retrieveConversation(conversationId);
+      overrideModel = conversation.model ?? undefined;
+    } catch {
+      // Model refresh is best-effort; mod failures must not block the turn.
+    }
+  }
+
+  const currentInput = ensureTurnInputMessageOtids(turnStartEmission.input);
+  const turnInput = createTurnInputState(
+    currentInput,
+    getInboundImageFailureModes({
+      imageFailureMode: msg.imageFailureMode,
+      messages: currentInput,
+    }),
+  );
   if (currentInput !== messagesToSend) {
     inboundUserTranscriptLines = buildInboundUserTranscriptLines(currentInput);
   }
+  const modAdapters = await ensureListenerModAdaptersForAgent(
+    runtime.listener,
+    agentId,
+  );
+  const listenerOptions = connectionId
+    ? runtime.listener.connections.get(connectionId)?.options
+    : runtime.listener.connections.values().next().value?.options;
+  const environmentDeviceId = listenerOptions?.deviceId;
   const preparedToolContext = await prepareToolExecutionContextForScope({
+    connectionId,
+    environmentDeviceId,
     agentId,
     conversationId,
+    clientToolset: msg.clientToolset,
     clientToolAllowlist: msg.clientToolAllowlist,
+    // Headless clients (SDK sessions, automation) opt out of tools that
+    // prompt the human mid-turn; the interactive set is owned by the harness.
+    ...(msg.excludeInteractiveTools
+      ? { exclude: [...INTERACTIVE_USER_INPUT_TOOL_NAMES] }
+      : {}),
     externalToolScopeIds: msg.externalToolScopeIds,
     workingDirectory,
     permissionModeState,
+    skillsDirectory: listenerOptions?.skillsDirectory,
+    skillSources: runtime.skillSources,
     cachedAgent,
-    channelTurnSources: msg.channelTurnSources,
-    modEvents: ensureListenerModAdapter(runtime.listener).events,
+    modContext: createListenerAgentModContext(agentId),
+    modAdapters,
+    modEvents: createListenerModEvents(modAdapters),
   });
+  if (isInterrupted()) {
+    return { kind: "interrupted" };
+  }
+
+  const availableSkills = (
+    await buildClientSkillsPayload({
+      agentId,
+      skillsDirectory: listenerOptions?.skillsDirectory,
+      skillSources: runtime.skillSources,
+    })
+  ).availableSkills;
   if (isInterrupted()) {
     return { kind: "interrupted" };
   }
@@ -275,15 +314,16 @@ export async function prepareListenerTurn(params: {
   runtime.currentToolsetPreference = preparedToolContext.toolsetPreference;
   runtime.currentLoadedTools =
     preparedToolContext.preparedToolContext.loadedToolNames;
+  runtime.currentAvailableSkills = availableSkills;
   return {
     kind: "ready",
     getCachedAgent: () => cachedAgent,
-    currentInput,
-    imageFailureModesByMessageOtid,
+    turnInput,
     inboundUserTranscriptLines,
     pendingNormalizationInterruptedToolCallIds: [
       ...queuedInterruptedToolCallIds,
     ],
     preparedToolContext,
+    ...(overrideModel ? { overrideModel } : {}),
   };
 }

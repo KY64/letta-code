@@ -431,7 +431,11 @@ function formatRetryEventStatusLines(
   ];
 }
 
-function upsertStatusLine(b: Buffers, id: string, lines: string[]): void {
+export function upsertStatusLine(
+  b: Buffers,
+  id: string,
+  lines: string[],
+): void {
   const existing = b.byId.get(id);
   if (existing?.kind === "status") {
     existing.lines = lines;
@@ -908,11 +912,11 @@ function trySplitContent(
   return true;
 }
 
-// OpenAI reasoning summaries can start a new `**Section Title**\n\n` block inside the
-// same otid without a leading separator. Insert the missing blank line so markdown
-// renders the title as a new paragraph instead of gluing it to the previous sentence.
+// Restore missing blank lines between adjacent OpenAI reasoning summary headings.
 function normalizeReasoningSectionBoundaries(text: string): string {
-  return text.replace(/([^\n])(\*\*[^*\n]+\*\*\n\n)/g, "$1\n\n$2");
+  return text
+    .replace(/\*\*\*\*/g, "**\n\n**")
+    .replace(/([^\n])(\*\*[^*\n]+\*\*\n\n)/g, "$1\n\n$2");
 }
 
 // Feed one SDK chunk; mutate buffers in place.

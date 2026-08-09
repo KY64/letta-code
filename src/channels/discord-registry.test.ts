@@ -274,7 +274,7 @@ describe("discord channel registry", () => {
     expect(createConversation).toHaveBeenCalledWith(
       {
         agent_id: "agent-1",
-        summary: "[Discord] DM with Cameron",
+        summary: "DM with Cameron",
       },
       undefined,
     );
@@ -382,6 +382,52 @@ describe("discord channel registry", () => {
         text: "You are not on the allowed users list for this Discord bot.",
       },
     ]);
+  });
+
+  test("admin users pass the Discord DM allowlist and auto-route", async () => {
+    clearChannelAccountStores();
+    __testOverrideLoadChannelAccounts(() => [
+      {
+        channel: "discord",
+        accountId: "discord-bot",
+        enabled: true,
+        token: "discord-token",
+        agentId: "agent-1",
+        defaultPermissionMode: "standard",
+        dmPolicy: "allowlist",
+        allowedUsers: ["user-2"],
+        adminUsers: ["user-1"],
+        createdAt: "2026-04-11T00:00:00.000Z",
+        updatedAt: "2026-04-11T00:00:00.000Z",
+      },
+    ]);
+
+    const { ChannelRegistry } = await import("@/channels/registry");
+    const registry = new ChannelRegistry();
+    const replies: Array<{ chatId: string; text: string }> = [];
+    const adapter = createAdapter(replies);
+    registry.registerAdapter(adapter);
+
+    const deliveries: unknown[] = [];
+    registry.setMessageHandler((delivery) => {
+      deliveries.push(delivery);
+    });
+    registry.setReady();
+
+    await adapter.onMessage?.(
+      createInboundMessage({
+        chatId: "dm-1",
+        threadId: null,
+        chatType: "direct",
+        isMention: false,
+        messageId: "dm-msg-1",
+      }),
+    );
+
+    expect(replies).toHaveLength(0);
+    expect(createConversation).toHaveBeenCalledTimes(1);
+    expect(getRoute("discord", "dm-1", "discord-bot")).not.toBe(null);
+    expect(deliveries).toHaveLength(1);
   });
 
   test("keeps explicit Discord pairing DMs on the pairing flow with the account agent", async () => {

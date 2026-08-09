@@ -10,14 +10,16 @@ import type {
   LettaStreamingResponse,
 } from "@letta-ai/letta-client/resources/agents/messages";
 import type { MessageCreateParams as ConversationMessageCreateParams } from "@letta-ai/letta-client/resources/conversations/messages";
+import type { SkillSource } from "@/agent/skill-sources";
 import { type Backend, getBackend } from "@/backend";
 import {
   type ClientTool,
-  type PermissionModeState,
+  getExecutionContextById,
   type PreparedToolExecutionContext,
   prepareCurrentToolExecutionContext,
   waitForToolsetReady,
 } from "@/tools/manager";
+import type { PermissionModeState } from "@/tools/permission-mode-state";
 import { debugLog, debugWarn, isDebugEnabled } from "@/utils/debug";
 import {
   assertSupportedBase64ImageMediaTypes,
@@ -190,6 +192,8 @@ export type SendMessageStreamOptions = {
   /** Per-conversation permission mode state. When provided, tool execution uses
    *  this scoped state instead of the global permissionMode singleton. */
   permissionModeState?: PermissionModeState;
+  /** Per-request skill sources. An empty array disables client skills. */
+  skillSources?: SkillSource[];
   /**
    * Per-request model override. Uses backend request-scoped override_model and
    * does not mutate agent/conversation persisted model configuration.
@@ -346,7 +350,9 @@ export async function sendMessageStreamWithBackend(
   const { clientSkills, errors: clientSkillDiscoveryErrors } =
     await buildClientSkillsPayload({
       agentId: opts.agentId,
-      skillSources: getSkillSources(),
+      skillsDirectory: getExecutionContextById(preparedToolContext.contextId)
+        ?.runtimeContext.skillsDirectory,
+      skillSources: opts.skillSources ?? getSkillSources(),
     });
 
   const resolvedConversationId = conversationId;
@@ -403,9 +409,6 @@ export async function sendMessageStreamWithBackend(
   }
 
   const extraHeaders: Record<string, string> = {};
-  if (process.env.LETTA_RESPONSES_WS === "1") {
-    extraHeaders["X-Experimental-OpenAI-Responses-Websocket"] = "true";
-  }
   if (previousResponseId) {
     extraHeaders[RESPONSE_STATE_HEADER] = encodeResponseStateHeader({
       v: 1,

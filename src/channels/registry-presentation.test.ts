@@ -4,7 +4,10 @@ import {
   __testOverrideSavePendingControlRequestStore,
   clearPendingControlRequestStore,
 } from "@/channels/pending-control-requests";
-import { buildSlackConversationSummary } from "@/channels/registry-presentation";
+import {
+  buildDirectReplyOptions,
+  buildSlackConversationSummary,
+} from "@/channels/registry-presentation";
 
 beforeEach(() => {
   __testOverrideLoadPendingControlRequestStore(null);
@@ -18,6 +21,27 @@ afterEach(() => {
   clearPendingControlRequestStore();
 });
 
+describe("buildDirectReplyOptions", () => {
+  test("anchors replies to the message while preserving the thread route", () => {
+    expect(
+      buildDirectReplyOptions({
+        messageId: "1712800000.000200",
+        threadId: "1712790000.000050",
+      }),
+    ).toEqual({
+      replyToMessageId: "1712800000.000200",
+      threadId: "1712790000.000050",
+    });
+  });
+
+  test("keeps the thread route when only a thread id is present", () => {
+    expect(buildDirectReplyOptions({ threadId: "42" })).toEqual({
+      replyToMessageId: undefined,
+      threadId: "42",
+    });
+  });
+});
+
 describe("buildSlackConversationSummary", () => {
   test("labels direct messages with the sender name", () => {
     expect(
@@ -28,7 +52,7 @@ describe("buildSlackConversationSummary", () => {
         senderName: "Charles",
         text: "hey there",
       }),
-    ).toBe("[Slack] DM with Charles");
+    ).toBe("DM with Charles");
   });
 
   test("labels threaded direct messages with a clipped text preview", () => {
@@ -42,7 +66,7 @@ describe("buildSlackConversationSummary", () => {
         text: "  following up in the DM thread about the deploy preview  ",
       }),
     ).toBe(
-      "[Slack] DM thread with Charles: following up in the DM thread about the deploy preview",
+      "DM thread with Charles: following up in the DM thread about the deploy preview",
     );
   });
 
@@ -55,9 +79,7 @@ describe("buildSlackConversationSummary", () => {
         senderName: "Charles",
         text: "  what messages do you see in this thread right now?  ",
       }),
-    ).toBe(
-      "[Slack] Thread: what messages do you see in this thread right now?",
-    );
+    ).toBe("Thread: what messages do you see in this thread right now?");
   });
 
   test("includes the channel label when available", () => {
@@ -71,7 +93,7 @@ describe("buildSlackConversationSummary", () => {
         text: "Need help with the deploy preview environment after lunch",
       }),
     ).toBe(
-      "[Slack] Thread in #random: Need help with the deploy preview environment after lunch",
+      "Thread in #random: Need help with the deploy preview environment after lunch",
     );
   });
 
@@ -84,6 +106,6 @@ describe("buildSlackConversationSummary", () => {
         senderName: "Charles",
         text: "   ",
       }),
-    ).toBe("[Slack] Thread C123");
+    ).toBe("Thread C123");
   });
 });
