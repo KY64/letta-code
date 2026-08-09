@@ -9,16 +9,14 @@ jobs:
   sync:
     if: github.repository != 'letta-ai/letta-code'
     runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-      workflows: write
+
     steps:
       - name: Checkout fork main
         uses: actions/checkout@v6
         with:
           ref: main
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: ${{ secrets.SYNC_TOKEN }}
 
       - name: Merge upstream main into fork main
         run: |
