@@ -31,6 +31,17 @@
       "reason": "Mutates shared channel account, route, pairing, and target stores."
     },
     {
+      "path": "src/channels/protocol-command-handler.test.ts",
+      "timeoutMs": 15000,
+      "reason": "Mutates shared channel account, route, credential-store, service-loader, and listener runtime state."
+    },
+    {
+      "path": "src/channels/service.test.ts",
+      "timeoutMs": 15000,
+      "env": { "LETTA_SKIP_KEYCHAIN_CHECK": "1" },
+      "reason": "Mutates shared channel stores and credential mode; local fixtures must not use the macOS keychain."
+    },
+    {
       "path": "src/channels/slack/media.test.ts",
       "timeoutMs": 15000,
       "reason": "Imports the real media module while Slack adapter tests replace it."
@@ -44,6 +55,12 @@
       "path": "src/cli/message-search-cache-warm.test.ts",
       "timeoutMs": 15000,
       "reason": "Uses a top-level Bun module mock for backend search."
+    },
+    {
+      "path": "src/cli/helpers/pinned-agent-listing.test.ts",
+      "timeoutMs": 15000,
+      "env": { "LETTA_SKIP_KEYCHAIN_CHECK": "1" },
+      "reason": "Mutates HOME, local-backend paths, the settings singleton, and the keychain service name."
     },
     {
       "path": "src/hooks/prompt-executor.test.ts",
@@ -107,6 +124,11 @@
       "path": "src/tools/bash.test.ts",
       "timeoutMs": 30000,
       "reason": "Spawns real shells and temporarily mutates process platform and PATH state."
+    },
+    {
+      "path": "src/tools/impl/github-pull-request-shell-adapters.test.ts",
+      "timeoutMs": 30000,
+      "reason": "Spawns every shell adapter while mutating PATH, the backend singleton, and process registries."
     },
     {
       "path": "src/tools/enter-worktree.test.ts",

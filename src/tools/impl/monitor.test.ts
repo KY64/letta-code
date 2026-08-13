@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocketServer } from "ws";
@@ -25,10 +31,6 @@ import { backgroundProcesses } from "./process_manager";
 import { task_output } from "./task-output";
 import { task_stop } from "./task-stop";
 
-function nodeCommand(script: string): string {
-  return `${JSON.stringify(process.execPath)} -e ${JSON.stringify(script)}`;
-}
-
 async function waitFor(
   predicate: () => boolean,
   timeoutMs = 4000,
@@ -46,12 +48,27 @@ describe("Monitor", () => {
   let scratchpad: string;
   let previousScratchpad: string | undefined;
   let queuedMessages: QueuedMessage[];
+  let childScriptIndex: number;
+
+  function quoteCommandArgument(value: string): string {
+    return process.platform === "win32"
+      ? `"${value.replaceAll('"', '""')}"`
+      : JSON.stringify(value);
+  }
+
+  function nodeCommand(script: string): string {
+    const scriptPath = join(scratchpad, `monitor-child-${childScriptIndex}.js`);
+    childScriptIndex += 1;
+    writeFileSync(scriptPath, script);
+    return `${quoteCommandArgument(process.execPath)} ${quoteCommandArgument(scriptPath)}`;
+  }
 
   beforeEach(() => {
     previousScratchpad = process.env.LETTA_SCRATCHPAD;
     scratchpad = mkdtempSync(join(tmpdir(), "monitor-test-"));
     process.env.LETTA_SCRATCHPAD = scratchpad;
     queuedMessages = [];
+    childScriptIndex = 0;
     clearPendingMessages();
     setMessageQueueAdder((message) => queuedMessages.push(message));
   });
@@ -158,10 +175,11 @@ describe("Monitor", () => {
     ).rejects.toThrow("control characters");
   });
 
-  test("uses the reference timeout and persistence defaults", async () => {
+  test("accepts an empty ws placeholder and uses the reference defaults", async () => {
     const result = await monitor({
       description: "defaults",
       command: nodeCommand('process.stdout.write("done\\n")'),
+      ws: { url: "", protocols: [] },
     });
 
     expect(result).toMatchObject({ timeoutMs: 300000, persistent: false });
@@ -252,7 +270,9 @@ describe("Monitor", () => {
       description: "large output",
       timeout_ms: 5000,
       persistent: false,
-      command: nodeCommand('process.stdout.write("x".repeat(1100000))'),
+      command: nodeCommand(
+        `process.stdout.write("x".repeat(${MONITOR_OUTPUT_FILE_BYTES}), () => setTimeout(() => process.stdout.write("y"), 250))`,
+      ),
     });
 
     await waitFor(
@@ -285,7 +305,7 @@ describe("Monitor", () => {
     ).toBe(true);
   });
 
-  test("streams WebSocket text and binary frames and reports close", async () => {
+  test("accepts an empty command placeholder and streams WebSocket frames", async () => {
     const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
     await new Promise<void>((resolve) => server.once("listening", resolve));
     const address = server.address();
@@ -303,6 +323,7 @@ describe("Monitor", () => {
         description: "socket events",
         timeout_ms: 5000,
         persistent: false,
+        command: "",
         ws: {
           url: `ws://127.0.0.1:${address.port}/events?token=secret`,
         },

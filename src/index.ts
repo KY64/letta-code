@@ -177,13 +177,14 @@ USAGE
   # maintenance
   letta update          Manually check for updates and install if available
   letta upgrade         Alias for \`letta update\`
-  letta --update        Alias for \`letta update\`
-  letta --upgrade       Alias for \`letta update\`
+  letta --update/--upgrade Aliases for \`letta update\`
   letta memory ...      Memory filesystem subcommands
   letta agents ...      Agents subcommands (JSON-only)
   letta environments ... List available remote environments (JSON-only)
+  letta teleport ...    Move the current conversation between environments
   letta messages ...    Messages subcommands (JSON-only)
   letta mods ...        List and manage local mods
+  letta sandbox ...     Transfer files to or from the current Cloud sandbox
   letta server ...      Run a remote environment, channels, or the App Server
   letta connect ...     Connect providers from terminal
   letta backend ...     Show or set the default backend
@@ -207,6 +208,7 @@ SUBCOMMANDS
   letta agents list [--query <text> | --name <name> | --tags <tags>]
   letta environments list [--online-only]
   letta environments current
+  letta teleport list|cloud|<environment>
   letta messages search --query <text> [--all-agents]
   letta messages list [--agent <id>]
   letta messages transcript --conversation <id> [--out <path>]

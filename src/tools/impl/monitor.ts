@@ -1,4 +1,4 @@
-import { appendFileSync } from "node:fs";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
 import stripAnsi from "strip-ansi";
 import { type RawData, WebSocket } from "ws";
 import { getCurrentWorkingDirectory } from "@/runtime-context";
@@ -118,14 +118,13 @@ class MonitorOutputWriter {
       `\n[output truncated at ${MONITOR_OUTPUT_FILE_BYTES} bytes]\n`,
       "utf8",
     );
-    const contentBudget = Math.max(0, remaining - marker.length);
-    const content = validUtf8Prefix(chunk, contentBudget);
-    const markerBudget = remaining - content.length;
-    appendFileSync(
-      this.path,
-      Buffer.concat([content, marker.subarray(0, markerBudget)]),
+    const content = validUtf8Prefix(
+      Buffer.concat([readFileSync(this.path), chunk]),
+      MONITOR_OUTPUT_FILE_BYTES - marker.length,
     );
-    this.bytesWritten = MONITOR_OUTPUT_FILE_BYTES;
+    const truncatedOutput = Buffer.concat([content, marker]);
+    writeFileSync(this.path, truncatedOutput);
+    this.bytesWritten = truncatedOutput.length;
     this.truncated = true;
   }
 }
@@ -215,13 +214,25 @@ function normalizeMonitorArgs(args: MonitorArgs): NormalizedMonitorArgs {
     throw new Error("Monitor command must be a string");
   }
 
-  const hasCommand = typeof normalized.command === "string";
-  const hasWebSocket = normalized.ws !== undefined;
+  // Some tool calls include both source fields with an empty value for the
+  // unused one.
+  const hasCommand =
+    typeof normalized.command === "string" && normalized.command.length > 0;
+  const hasWebSocket =
+    normalized.ws !== undefined &&
+    !(
+      typeof normalized.ws === "object" &&
+      normalized.ws !== null &&
+      normalized.ws.url === ""
+    );
   if (Number(hasCommand) + Number(hasWebSocket) !== 1) {
     throw new Error("Monitor requires exactly one of command or ws");
   }
-  if (hasCommand && !normalized.command) {
-    throw new Error("Monitor requires exactly one of command or ws");
+  if (!hasCommand) {
+    delete normalized.command;
+  }
+  if (!hasWebSocket) {
+    delete normalized.ws;
   }
   if (
     hasCommand &&
