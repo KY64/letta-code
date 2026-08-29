@@ -1,3 +1,16 @@
+export type {
+  SlackAttachmentReadClient,
+  SlackFetchedFile,
+  SlackFileFetcher,
+  SlackFileLike,
+  SlackFileMetadata,
+} from "./channels/slack/attachment-primitives";
+export {
+  collectSlackFiles,
+  fetchSlackFile,
+  resolveSlackFileMetadata,
+  resolveSlackMessageFiles,
+} from "./channels/slack/attachment-primitives";
 export {
   isOwnSlackBotInboundMessage,
   isSlackBotAuthoredInboundMessage,
@@ -44,7 +57,6 @@ export {
 } from "./channels/slack/progress";
 export {
   normalizeSlackReactionName,
-  normalizeSlackText,
   resolveSlackChatType,
   resolveSlackOutboundThreadTs,
   slackTimestampToMillis,
@@ -65,3 +77,8 @@ export type {
   SlackStatusWriteClient,
 } from "./channels/slack/status-controller";
 export { createSlackStatusController } from "./channels/slack/status-controller";
+export {
+  resolveSlackUserMentionsInMessage,
+  sanitizeSlackUserDisplayName,
+  stripSlackBotMention,
+} from "./channels/slack/user-mentions";

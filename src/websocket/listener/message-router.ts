@@ -21,18 +21,19 @@ import {
 import { handleExecuteCommand } from "./commands";
 import { handleAgentConversationManagementProtocolCommand } from "./commands/agents-conversations";
 import { handleAppServerInfoCommand } from "./commands/app-server-info";
+import { handleCwdProtocolCommand } from "./commands/boot-working-directory";
 import { handleChatGPTUsageCommand } from "./commands/chatgpt-usage";
 import { handleConnectProvidersCommand } from "./commands/connect-providers";
 import { handleCronProtocolCommand } from "./commands/cron";
 import { handleGitBranchCommand } from "./commands/git-branches";
-import { handleMemoryProtocolCommand } from "./commands/memory";
+import { handleMemfsSyncedMemoryProtocolCommand } from "./commands/memory-command-sync";
 import { handleModelToolsetCommand } from "./commands/model-toolset";
 import { handleRuntimeStartProtocolCommand } from "./commands/runtime-start";
 import { handleSecretsCommand } from "./commands/secrets";
 import { handleSettingsProtocolCommand } from "./commands/settings";
 import { handleSkillAgentProtocolCommand } from "./commands/skills-agents";
 import { subscribeListenerConnection } from "./connection";
-import { getBootWorkingDirectory, getExportedCwdMap } from "./cwd";
+import { getBootWorkingDirectory } from "./cwd";
 import {
   handleExternalToolCallResponseCommand,
   updateRuntimeExternalTools,
@@ -63,9 +64,13 @@ import {
 } from "./queue";
 import { emitLoopErrorNotice } from "./recoverable-notices";
 import { getActiveRuntime, safeEmitWsEvent } from "./runtime";
+import { parseListenerReadyMessage } from "./split-stream-lifecycle";
 import {
+  buildTeleportContinuationMessages,
+  clearPriorReadyTeleports,
   handleTeleportProbe,
   handleTeleportRequest,
+  isRuntimeTeleportPending,
   takeFailedTeleport,
 } from "./teleport";
 import type { ListenerTransport } from "./transport";
@@ -100,9 +105,8 @@ type TrackListenerError = (
 type FileCommandSession = {
   handle(parsed: unknown): boolean;
 };
-
 type RuntimeScope = {
-  agent_id: string;
+  agent_id: string | null;
   conversation_id: string;
 };
 
@@ -206,7 +210,8 @@ export function createListenerMessageHandler(
     let parsedScope: ParsedRuntimeScope = null;
 
     try {
-      const lifecycleMessage = parseServerLifecycleMessage(data);
+      const lifecycleMessage =
+        parseListenerReadyMessage(data) ?? parseServerLifecycleMessage(data);
       if (lifecycleMessage) {
         // Record relay pongs so the heartbeat watchdog can detect a half-open
         // socket (no pong within the timeout) and force a reconnect.
@@ -313,7 +318,7 @@ export function createListenerMessageHandler(
                   {
                     type: "approval",
                     approvals,
-                    otid: crypto.randomUUID(),
+                    otid: parsed.teleport_id,
                   },
                 ],
               },
@@ -434,27 +439,39 @@ export function createListenerMessageHandler(
             "input",
           );
         };
-
         if (runtime !== getActiveRuntime() || runtime.intentionallyClosed) {
           console.log(`[Listen V2] Dropping input: runtime mismatch or closed`);
           acknowledgeInput(false, "Runtime is no longer active");
           return;
         }
-
         if (parsed.payload.kind === "teleport_continue") {
+          const teleportAgentId = parsed.runtime.agent_id;
+          if (!teleportAgentId) {
+            acknowledgeInput(
+              false,
+              "Teleport requires an agent-backed runtime",
+            );
+            return;
+          }
+          const teleportId = parsed.payload.teleport_id;
+          clearPriorReadyTeleports({
+            listener: runtime,
+            agentId: teleportAgentId,
+            conversationId: parsed.runtime.conversation_id,
+            currentTeleportId: teleportId,
+          });
           const scopedRuntime = getOrCreateScopedRuntime(
             runtime,
             parsed.runtime.agent_id,
             parsed.runtime.conversation_id,
           );
-          const acceptedKey = `teleport:${parsed.payload.teleport_id}`;
+          const acceptedKey = `teleport:${teleportId}`;
           const previousDisposition =
             scopedRuntime.acceptedInputDispositions.get(acceptedKey);
           if (previousDisposition) {
             acknowledgeInput(true, undefined, previousDisposition);
             return;
           }
-
           const approvals = parsed.payload.continuation?.approvals;
           if (!approvals || approvals.length === 0) {
             acknowledgeInput(true);
@@ -467,7 +484,6 @@ export function createListenerMessageHandler(
             );
             return;
           }
-
           scopedRuntime.acceptedInputDispositions.set(acceptedKey, "started");
           acknowledgeInput(true, undefined, "started");
           runDetachedListenerTask("teleport_continue", async () => {
@@ -475,15 +491,12 @@ export function createListenerMessageHandler(
               {
                 type: "message",
                 connectionId,
-                agentId: parsed.runtime.agent_id,
+                agentId: teleportAgentId,
                 conversationId: parsed.runtime.conversation_id,
-                messages: [
-                  {
-                    type: "approval",
-                    approvals,
-                    otid: crypto.randomUUID(),
-                  },
-                ],
+                messages: buildTeleportContinuationMessages({
+                  teleportId,
+                  approvals,
+                }),
               },
               socket,
               scopedRuntime,
@@ -493,7 +506,6 @@ export function createListenerMessageHandler(
           });
           return;
         }
-
         if (parsed.payload.kind === "approval_response") {
           const handled = await handleApprovalResponseInput(runtime, {
             runtime: parsed.runtime,
@@ -512,7 +524,6 @@ export function createListenerMessageHandler(
           );
           return;
         }
-
         const inputPayload = parsed.payload;
         if (inputPayload.kind !== "create_message") {
           emitLoopErrorNotice(socket, runtime, {
@@ -525,11 +536,12 @@ export function createListenerMessageHandler(
           acknowledgeInput(false, "Unsupported input payload kind");
           return;
         }
-
         const incoming: IncomingMessage = {
           type: "message",
           connectionId,
-          agentId: parsed.runtime.agent_id,
+          ...(parsed.runtime.agent_id
+            ? { agentId: parsed.runtime.agent_id }
+            : {}),
           conversationId: parsed.runtime.conversation_id,
           clientToolAllowlist: inputPayload.client_tool_allowlist,
           clientToolset: inputPayload.client_toolset,
@@ -588,13 +600,6 @@ export function createListenerMessageHandler(
 
         if (shouldQueueInboundMessage(incoming)) {
           const stampedIncoming = stampInboundUserMessageOtids(incoming);
-          if (
-            shouldProcessInboundMessageDirectly(scopedRuntime, stampedIncoming)
-          ) {
-            processIncomingMessageDirectly(stampedIncoming);
-            return;
-          }
-
           const clientMessageId = getInboundClientMessageId(stampedIncoming);
           const acceptedDisposition = getAcceptedInputDisposition(
             scopedRuntime,
@@ -604,6 +609,23 @@ export function createListenerMessageHandler(
             acknowledgeInput(true, undefined, acceptedDisposition);
             return;
           }
+          if (
+            isRuntimeTeleportPending(
+              runtime,
+              scopedRuntime.agentId,
+              scopedRuntime.conversationId,
+            )
+          ) {
+            acknowledgeInput(false, "Conversation is switching computers");
+            return;
+          }
+          if (
+            shouldProcessInboundMessageDirectly(scopedRuntime, stampedIncoming)
+          ) {
+            processIncomingMessageDirectly(stampedIncoming);
+            return;
+          }
+
           const enqueued = enqueueInboundUserMessage(
             scopedRuntime,
             stampedIncoming,
@@ -728,13 +750,13 @@ export function createListenerMessageHandler(
           "remove_queue_item_response",
           "remove_queue_item",
         );
-        // Broadcast the updated queue so all connected clients see the change
-        if (removed !== null) {
-          emitQueueUpdateIfOpen(runtime, {
-            agent_id: parsed.runtime.agent_id,
-            conversation_id: parsed.runtime.conversation_id,
-          });
-        }
+        // Broadcast the authoritative queue snapshot even when the item was
+        // NOT found: a consumer removing an already-drained item is holding
+        // a stale queue copy, and this snapshot repairs it. (LET-11174)
+        emitQueueUpdateIfOpen(runtime, {
+          agent_id: parsed.runtime.agent_id,
+          conversation_id: parsed.runtime.conversation_id,
+        });
         return;
       }
 
@@ -743,8 +765,9 @@ export function createListenerMessageHandler(
       }
 
       if (
-        handleMemoryProtocolCommand(parsed, {
+        handleMemfsSyncedMemoryProtocolCommand(parsed, {
           socket,
+          runtime,
           safeSocketSend,
           runDetachedListenerTask,
         })
@@ -840,19 +863,15 @@ export function createListenerMessageHandler(
         return;
       }
 
-      if (parsed.type === "get_cwd_map") {
-        safeSocketSend(
+      if (
+        parsed.type === "get_cwd_map" ||
+        parsed.type === "set_boot_working_directory"
+      ) {
+        await handleCwdProtocolCommand(parsed, {
           socket,
-          {
-            type: "get_cwd_map_response",
-            request_id: parsed.request_id,
-            success: true,
-            cwd_map: getExportedCwdMap(runtime),
-            boot_working_directory: getBootWorkingDirectory(runtime),
-          },
-          "get_cwd_map_response",
-          "get_cwd_map",
-        );
+          runtime,
+          safeSocketSend,
+        });
         return;
       }
 

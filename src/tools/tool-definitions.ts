@@ -18,6 +18,8 @@ import ListDirectoryGeminiDescription from "./descriptions/ListDirectoryGemini.m
 import LSDescription from "./descriptions/LS.md";
 import MemoryDescription from "./descriptions/Memory.md";
 import MemoryApplyPatchDescription from "./descriptions/MemoryApplyPatch.md";
+import MemoryApplyPatchV2Description from "./descriptions/MemoryApplyPatchV2.md";
+import MemoryV2Description from "./descriptions/MemoryV2.md";
 import MonitorDescription from "./descriptions/Monitor.md";
 import MultiEditDescription from "./descriptions/MultiEdit.md";
 import ReadDescription from "./descriptions/Read.md";
@@ -29,6 +31,7 @@ import ReadManyFilesGeminiDescription from "./descriptions/ReadManyFilesGemini.m
 import ReplaceGeminiDescription from "./descriptions/ReplaceGemini.md";
 import RunShellCommandGeminiDescription from "./descriptions/RunShellCommandGemini.md";
 import SearchFileContentGeminiDescription from "./descriptions/SearchFileContentGemini.md";
+import SetWorkingDirectoryDescription from "./descriptions/SetWorkingDirectory.md";
 import ShellDescription from "./descriptions/Shell.md";
 import ShellCommandDescription from "./descriptions/ShellCommand.md";
 import SkillDescription from "./descriptions/Skill.md";
@@ -77,6 +80,7 @@ import { read_many_files } from "./impl/read-many-files-gemini";
 import { replace } from "./impl/replace-gemini";
 import { run_shell_command } from "./impl/run-shell-command-gemini";
 import { search_file_content } from "./impl/search-file-content-gemini";
+import { set_working_directory } from "./impl/set-working-directory";
 import { shell } from "./impl/shell";
 import { shell_command } from "./impl/shell-command";
 import { skill } from "./impl/skill";
@@ -113,6 +117,7 @@ import ListDirectoryGeminiSchema from "./schemas/ListDirectoryGemini.json";
 import LSSchema from "./schemas/LS.json";
 import MemorySchema from "./schemas/Memory.json";
 import MemoryApplyPatchSchema from "./schemas/MemoryApplyPatch.json";
+import MemoryV2Schema from "./schemas/MemoryV2.json";
 import MonitorSchema from "./schemas/Monitor.json";
 import MultiEditSchema from "./schemas/MultiEdit.json";
 import ReadSchema from "./schemas/Read.json";
@@ -124,6 +129,7 @@ import ReadManyFilesGeminiSchema from "./schemas/ReadManyFilesGemini.json";
 import ReplaceGeminiSchema from "./schemas/ReplaceGemini.json";
 import RunShellCommandGeminiSchema from "./schemas/RunShellCommandGemini.json";
 import SearchFileContentGeminiSchema from "./schemas/SearchFileContentGemini.json";
+import SetWorkingDirectorySchema from "./schemas/SetWorkingDirectory.json";
 import ShellSchema from "./schemas/Shell.json";
 import ShellCommandSchema from "./schemas/ShellCommand.json";
 import SkillSchema from "./schemas/Skill.json";
@@ -153,6 +159,17 @@ const WINDOWS_BASH_EXECUTION_GUIDANCE = `Windows execution:
 - Write commands using PowerShell-compatible syntax by default. POSIX/bash constructs such as heredocs, \`export VAR=...\`, and Unix-style shell quoting may not work unless you explicitly invoke a POSIX shell.
 
 ${WINDOWS_UNIFIED_EXEC_GUIDANCE}`;
+
+export const ROOT_MEMORY_TOOL_ASSETS = {
+  memory: {
+    schema: MemoryV2Schema,
+    description: MemoryV2Description.trim(),
+  },
+  memory_apply_patch: {
+    schema: MemoryApplyPatchSchema,
+    description: MemoryApplyPatchV2Description.trim(),
+  },
+} as const;
 
 export function buildBashDescriptionForPlatform(
   platform: NodeJS.Platform = process.platform,
@@ -276,6 +293,11 @@ const toolDefinitions = {
     schema: ReadLSPSchema,
     description: ReadLSPDescription.trim(),
     impl: read_lsp,
+  }),
+  SetWorkingDirectory: defineTool({
+    schema: SetWorkingDirectorySchema,
+    description: SetWorkingDirectoryDescription.trim(),
+    impl: set_working_directory,
   }),
   Skill: defineTool({
     schema: SkillSchema,

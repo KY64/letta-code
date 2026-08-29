@@ -34,8 +34,13 @@ import type {
   AppServerInfoCommand,
   AppServerInfoResponseMessage,
 } from "./app-server-info";
+import type {
+  ApprovalClassificationEndMessage,
+  UmiLifecycleMessageBase,
+} from "./approval-classification-protocol";
 import type { BackgroundProcessSummary } from "./background-process-protocol";
 import type { ConversationForkBody } from "./conversation-fork-protocol";
+import type * as CwdProtocol from "./cwd-protocol";
 import type {
   ExternalToolCallRequestMessage,
   ExternalToolCallResponseCommand,
@@ -43,13 +48,29 @@ import type {
   RuntimeExternalToolsUpdateResponseMessage,
   RuntimeStartExternalToolsGroup,
 } from "./external-tool-protocol";
-import type { RuntimeScope } from "./runtime-scope";
-import type { CronRunLogPage, CronTask } from "./schedule-protocol";
+import type { LoopState } from "./loop-status-protocol";
+import type {
+  AgentRuntimeScope,
+  ConversationRuntimeScope,
+} from "./runtime-scope";
+import type {
+  RuntimeStartClientInfo,
+  RuntimeStartCreateAgentOptions,
+  RuntimeStartCreateConversationOptions,
+} from "./runtime-start-protocol";
+import type {
+  CronProtocolCommand,
+  CronProtocolResponseMessage,
+} from "./schedule-protocol";
 import type * as TeleportProtocol from "./teleport-protocol";
 
+export type * from "./approval-classification-protocol";
 export type * from "./background-process-protocol";
+export type * from "./cwd-protocol";
 export type * from "./external-tool-protocol";
+export type * from "./loop-status-protocol";
 export type * from "./runtime-scope";
+export type * from "./runtime-start-protocol";
 export type * from "./schedule-protocol";
 export type * from "./teleport-protocol";
 
@@ -79,7 +100,7 @@ export interface ExperimentSnapshot {
  * Base envelope shared by all v2 websocket messages.
  */
 export interface RuntimeEnvelope {
-  runtime: RuntimeScope;
+  runtime: ConversationRuntimeScope;
   event_seq: number;
   emitted_at: string;
   idempotency_key: string;
@@ -396,16 +417,6 @@ export interface ModCommandInfo {
   args?: string;
 }
 
-export type LoopStatus =
-  | "SENDING_API_REQUEST"
-  | "WAITING_FOR_API_RESPONSE"
-  | "RETRYING_API_REQUEST"
-  | "PROCESSING_API_RESPONSE"
-  | "EXECUTING_CLIENT_SIDE_TOOL"
-  | "EXECUTING_COMMAND"
-  | "WAITING_ON_APPROVAL"
-  | "WAITING_ON_INPUT";
-
 export type QueueMessageKind =
   | "message"
   | "task_notification"
@@ -429,25 +440,6 @@ export interface QueueMessage {
   source: QueueMessageSource;
   content: MessageCreate["content"] | string;
   enqueued_at: string;
-}
-
-/**
- * Loop state is intentionally small and finite.
- * Message-level details are projected from runtime deltas.
- *
- * Queue state is delivered separately via `update_queue` messages.
- */
-export interface LoopState {
-  status: LoopStatus;
-  active_run_ids: string[];
-  /**
-   * Tool call ids currently executing client-side. Populated only while
-   * `status` is `EXECUTING_CLIENT_SIDE_TOOL`; empty otherwise. Lets
-   * observer UIs render an authoritative executing set that self-heals on
-   * every status frame instead of pairing client_tool_start/end lifecycle
-   * events, which are unrecoverable if a frame is lost.
-   */
-  executing_tool_call_ids: string[];
 }
 
 export interface DeviceStatusUpdateMessage extends RuntimeEnvelope {
@@ -474,13 +466,6 @@ export interface QueueUpdateMessage extends RuntimeEnvelope {
  * Standard Letta message delta forwarded through the stream channel.
  */
 export type MessageDelta = { type: "message" } & LettaStreamingResponse;
-
-export interface UmiLifecycleMessageBase {
-  id: string;
-  date: string;
-  message_type: string;
-  run_id?: string;
-}
 
 export interface ClientToolStartMessage extends UmiLifecycleMessageBase {
   message_type: "client_tool_start";
@@ -556,6 +541,7 @@ export interface LoopErrorMessage extends UmiLifecycleMessageBase {
 
 export type StreamDelta =
   | MessageDelta
+  | ApprovalClassificationEndMessage
   | ClientToolStartMessage
   | ClientToolEndMessage
   | CommandStartMessage
@@ -690,14 +676,14 @@ export interface InputCommand {
   type: "input";
   /** Correlates acknowledgement without waiting for the turn to finish. */
   request_id?: string;
-  runtime: RuntimeScope;
+  runtime: ConversationRuntimeScope;
   payload: InputPayload;
 }
 
 export interface InputAcceptedResponseMessage {
   type: "input_accepted";
   request_id: string;
-  runtime: RuntimeScope;
+  runtime: ConversationRuntimeScope;
   accepted: boolean;
   disposition?: "started" | "queued";
   error?: string;
@@ -712,13 +698,13 @@ export interface ChangeDeviceStatePayload {
 
 export interface ChangeDeviceStateCommand {
   type: "change_device_state";
-  runtime: RuntimeScope;
+  runtime: ConversationRuntimeScope;
   payload: ChangeDeviceStatePayload;
 }
 
 export interface AbortMessageCommand {
   type: "abort_message";
-  runtime: RuntimeScope;
+  runtime: ConversationRuntimeScope;
   /** When provided, app-server sends abort_message_response on the control channel. */
   request_id?: string;
   run_id?: string | null;
@@ -726,7 +712,7 @@ export interface AbortMessageCommand {
 
 export interface SyncCommand {
   type: "sync";
-  runtime: RuntimeScope;
+  runtime: ConversationRuntimeScope;
   /** When provided, app-server sends sync_response after replaying state. */
   request_id?: string;
   /**
@@ -742,30 +728,6 @@ export interface SyncCommand {
   force_device_status?: boolean;
 }
 
-export interface RuntimeStartCreateAgentOptions {
-  /** Body forwarded to the Letta agents create API. */
-  body: AgentCreateParams;
-  /** Whether to pin the created agent globally. Defaults to true. */
-  pin_global?: boolean;
-  /**
-   * Whether to set up the memory filesystem for the created agent (tag
-   * stamp + settings + repo clone). Defaults to true; false creates a
-   * worker-style agent whose memory scope is provided per session.
-   */
-  memfs?: boolean;
-}
-
-export interface RuntimeStartCreateConversationOptions {
-  /** Body forwarded to the Letta conversations create API. */
-  body?: Omit<ConversationCreateParams, "agent_id">;
-}
-
-export interface RuntimeStartClientInfo {
-  name: string;
-  title?: string;
-  version?: string;
-}
-
 export interface RuntimeStartCommand {
   type: "runtime_start";
   /** Echoed back in the response for request correlation. */
@@ -776,7 +738,7 @@ export interface RuntimeStartCommand {
   create_agent?: RuntimeStartCreateAgentOptions;
   /** Existing conversation to start/resume. Mutually exclusive with create_conversation. */
   conversation_id?: string;
-  /** Create a new conversation for the resolved agent before starting the runtime. */
+  /** Create a new conversation. Without an agent, body must provide model and system. */
   create_conversation?: RuntimeStartCreateConversationOptions;
   /** Canonical source tags to merge. Matching legacy summary prefixes are removed. */
   conversation_source_tags?: readonly string[];
@@ -784,6 +746,7 @@ export interface RuntimeStartCommand {
   cwd?: string | null;
   /** Initial permission mode for this runtime scope. */
   mode?: DevicePermissionMode;
+  workspace_sandbox?: { root: string; isolation_root: string };
   skill_sources?: readonly ("bundled" | "global" | "agent" | "project")[];
   /** Preserve the current override when skill_sources is omitted. */ preserve_skill_sources?: boolean;
   /** Optional client metadata for diagnostics/future protocol negotiation. */
@@ -847,7 +810,7 @@ export interface TerminalExitedMessage {
 export interface AbortMessageResponseMessage {
   type: "abort_message_response";
   request_id: string;
-  runtime: RuntimeScope;
+  runtime: ConversationRuntimeScope;
   /** True when an active turn or pending approval was interrupted. */
   aborted: boolean;
   success: boolean;
@@ -857,7 +820,7 @@ export interface AbortMessageResponseMessage {
 export interface SyncResponseMessage {
   type: "sync_response";
   request_id: string;
-  runtime: RuntimeScope;
+  runtime: ConversationRuntimeScope;
   success: boolean;
   error?: string;
 }
@@ -1512,7 +1475,7 @@ export interface ChatGPTUsageReadResponseMessage {
 }
 
 export interface UpdateModelPayload {
-  /** Preferred model identifier from models.json (e.g. "sonnet") */
+  /** Preferred runtime catalog model identifier (e.g. "sonnet") */
   model_id?: string;
   /** Optional direct handle override (e.g. "anthropic/claude-sonnet-4-6") */
   model_handle?: string;
@@ -1532,8 +1495,8 @@ export interface UpdateModelCommand {
   type: "update_model";
   /** Echoed back in the response for request correlation. */
   request_id: string;
-  /** Runtime scope — identifies which agent + conversation this targets */
-  runtime: RuntimeScope;
+  /** Runtime scope — identifies which conversation this targets. */
+  runtime: ConversationRuntimeScope;
   payload: UpdateModelPayload;
 }
 
@@ -1564,7 +1527,7 @@ export interface UpdateModelResponseMessage {
   type: "update_model_response";
   request_id: string;
   success: boolean;
-  runtime?: RuntimeScope;
+  runtime?: ConversationRuntimeScope;
   applied_to?: "agent" | "conversation";
   model_id?: string;
   model_handle?: string;
@@ -1576,8 +1539,8 @@ export interface UpdateToolsetCommand {
   type: "update_toolset";
   /** Echoed back in the response for request correlation. */
   request_id: string;
-  /** Runtime scope — identifies which agent + conversation this targets */
-  runtime: RuntimeScope;
+  /** Runtime scope — identifies which conversation this targets. */
+  runtime: ConversationRuntimeScope;
   /** The toolset preference to apply (e.g. "auto", "default", "codex", "gemini") */
   toolset_preference: ToolsetPreference;
 }
@@ -1586,99 +1549,10 @@ export interface UpdateToolsetResponseMessage {
   type: "update_toolset_response";
   request_id: string;
   success: boolean;
-  runtime?: RuntimeScope;
+  runtime?: ConversationRuntimeScope;
   current_toolset?: ToolsetName;
   current_toolset_preference?: ToolsetPreference;
   error?: string;
-}
-
-export interface CronListCommand {
-  type: "cron_list";
-  /** Echoed back in the response for request correlation. */
-  request_id: string;
-  /** Optional agent filter. */
-  agent_id?: string;
-  /** Optional conversation filter. */
-  conversation_id?: string;
-}
-
-export interface CronAddCommand {
-  type: "cron_add";
-  /** Echoed back in the response for request correlation. */
-  request_id: string;
-  agent_id: string;
-  /**
-   * Conversation target for scheduled fires.
-   * - omitted/"default": agent default conversation
-   * - "new": create a fresh conversation for every fire
-   * - any other string: existing conversation id
-   */
-  conversation_id?: string;
-  name: string;
-  description: string;
-  cron: string;
-  timezone?: string;
-  recurring: boolean;
-  prompt: string;
-  /** Optional ISO timestamp for one-shot tasks. */
-  scheduled_for?: string | null;
-}
-
-export interface CronGetCommand {
-  type: "cron_get";
-  /** Echoed back in the response for request correlation. */
-  request_id: string;
-  task_id: string;
-}
-
-export interface CronRunsCommand {
-  type: "cron_runs";
-  /** Echoed back in the response for request correlation. */
-  request_id: string;
-  task_id: string;
-  /** Maximum run-log entries to return. */
-  limit?: number;
-  /** Page offset for run-log entries. */
-  offset?: number;
-  /** Optional run id filter. */
-  run_id?: string;
-}
-
-export interface CronTriggerCommand {
-  type: "cron_trigger";
-  /** Echoed back in the response for request correlation. */
-  request_id: string;
-  task_id: string;
-}
-
-export interface CronUpdateCommand {
-  type: "cron_update";
-  /** Echoed back in the response for request correlation. */
-  request_id: string;
-  task_id: string;
-  name?: string;
-  description?: string;
-  conversation_id?: string;
-  cron?: string;
-  timezone?: string;
-  recurring?: boolean;
-  prompt?: string;
-  /** Optional ISO timestamp for one-shot tasks. */
-  scheduled_for?: string | null;
-}
-
-export interface CronDeleteCommand {
-  type: "cron_delete";
-  /** Echoed back in the response for request correlation. */
-  request_id: string;
-  task_id: string;
-}
-
-export interface CronDeleteAllCommand {
-  type: "cron_delete_all";
-  /** Echoed back in the response for request correlation. */
-  request_id: string;
-  agent_id: string;
 }
 
 export interface SkillEnableCommand {
@@ -1852,34 +1726,17 @@ export interface ConversationCompactCommand {
   body?: MessageCompactParams;
 }
 
-export interface GetCwdMapCommand {
-  type: "get_cwd_map";
-  /** Echoed back in the response for request correlation. */
-  request_id: string;
-}
-
-export interface GetCwdMapResponseMessage {
-  type: "get_cwd_map_response";
-  request_id: string;
-  success: boolean;
-  /** Persisted per-conversation CWD overrides, keyed by listener scope key. */
-  cwd_map: Record<string, string>;
-  /** Listener boot CWD used when a conversation has no entry in cwd_map. */
-  boot_working_directory: string | null;
-  error?: string;
-}
-
 export interface GetReflectionSettingsCommand {
   type: "get_reflection_settings";
   /** Echoed back in the response for request correlation. */
   request_id: string;
-  runtime: RuntimeScope;
+  runtime: AgentRuntimeScope;
 }
 export interface SetReflectionSettingsCommand {
   type: "set_reflection_settings";
   /** Echoed back in the response for request correlation. */
   request_id: string;
-  runtime: RuntimeScope;
+  runtime: AgentRuntimeScope;
   settings: {
     trigger: ReflectionTriggerMode;
     step_count: number;
@@ -1942,7 +1799,7 @@ export interface ChannelAccountBindCommand {
   request_id: string;
   channel_id: ChannelId;
   account_id: string;
-  runtime: RuntimeScope;
+  runtime: AgentRuntimeScope;
 }
 
 export interface ChannelAccountUnbindCommand {
@@ -2018,7 +1875,7 @@ export interface ChannelPairingBindCommand {
   request_id: string;
   channel_id: ChannelId;
   account_id?: string;
-  runtime: RuntimeScope;
+  runtime: AgentRuntimeScope;
   code: string;
 }
 
@@ -2043,7 +1900,7 @@ export interface ChannelTargetBindCommand {
   request_id: string;
   channel_id: ChannelId;
   account_id?: string;
-  runtime: RuntimeScope;
+  runtime: AgentRuntimeScope;
   target_id: string;
 }
 
@@ -2061,75 +1918,7 @@ export interface ChannelRouteUpdateCommand {
   channel_id: ChannelId;
   account_id?: string;
   chat_id: string;
-  runtime: RuntimeScope;
-}
-
-export interface CronListResponseMessage {
-  type: "cron_list_response";
-  request_id: string;
-  tasks: CronTask[];
-  success: boolean;
-  error?: string;
-}
-
-export interface CronAddResponseMessage {
-  type: "cron_add_response";
-  request_id: string;
-  success: boolean;
-  task?: CronTask;
-  warning?: string;
-  error?: string;
-}
-
-export interface CronGetResponseMessage {
-  type: "cron_get_response";
-  request_id: string;
-  success: boolean;
-  found: boolean;
-  task: CronTask | null;
-  error?: string;
-}
-
-export interface CronRunsResponseMessage {
-  type: "cron_runs_response";
-  request_id: string;
-  success: boolean;
-  page?: CronRunLogPage;
-  error?: string;
-}
-
-export interface CronTriggerResponseMessage {
-  type: "cron_trigger_response";
-  request_id: string;
-  success: boolean;
-  found: boolean;
-  task?: CronTask;
-  error?: string;
-}
-
-export interface CronUpdateResponseMessage {
-  type: "cron_update_response";
-  request_id: string;
-  success: boolean;
-  task?: CronTask;
-  error?: string;
-}
-
-export interface CronDeleteResponseMessage {
-  type: "cron_delete_response";
-  request_id: string;
-  success: boolean;
-  found: boolean;
-  error?: string;
-}
-
-export interface CronDeleteAllResponseMessage {
-  type: "cron_delete_all_response";
-  request_id: string;
-  success: boolean;
-  agent_id: string;
-  deleted: number;
-  error?: string;
+  runtime: AgentRuntimeScope;
 }
 
 export interface CronsUpdatedMessage {
@@ -2263,7 +2052,7 @@ export interface RuntimeStartResponseMessage {
   type: "runtime_start_response";
   request_id: string;
   success: boolean;
-  runtime: RuntimeScope | null;
+  runtime: ConversationRuntimeScope | null;
   agent: AgentState | null;
   conversation: Conversation | null;
   created: {
@@ -2531,7 +2320,7 @@ export interface ExecuteCommandCommand {
   /** Correlation id (echoed in the response stream deltas) */
   request_id: string;
   /** Runtime scope — identifies which agent + conversation this targets */
-  runtime: RuntimeScope;
+  runtime: AgentRuntimeScope;
   /** Optional command arguments (everything after the command name). */
   args?: string;
 }
@@ -2556,7 +2345,7 @@ export interface RemoveQueueItemCommand {
   /** Correlation id (echoed back in the response for request correlation). */
   request_id: string;
   /** Runtime scope — identifies which agent + conversation this targets. */
-  runtime: RuntimeScope;
+  runtime: AgentRuntimeScope;
   /** The queue item ID to remove. */
   item_id: string;
 }
@@ -2718,14 +2507,7 @@ export type WsProtocolCommand =
   | ChatGPTUsageReadCommand
   | UpdateModelCommand
   | UpdateToolsetCommand
-  | CronListCommand
-  | CronAddCommand
-  | CronGetCommand
-  | CronRunsCommand
-  | CronTriggerCommand
-  | CronUpdateCommand
-  | CronDeleteCommand
-  | CronDeleteAllCommand
+  | CronProtocolCommand
   | SkillEnableCommand
   | SkillDisableCommand
   | CreateAgentCommand
@@ -2743,7 +2525,8 @@ export type WsProtocolCommand =
   | ConversationForkCommand
   | ConversationMessagesListCommand
   | ConversationCompactCommand
-  | GetCwdMapCommand
+  | CwdProtocol.SetBootWorkingDirectoryCommand
+  | CwdProtocol.GetCwdMapCommand
   | GetReflectionSettingsCommand
   | SetReflectionSettingsCommand
   | GetExperimentsCommand
@@ -2820,14 +2603,7 @@ export type WsProtocolMessage =
   | ChatGPTUsageReadResponseMessage
   | UpdateModelResponseMessage
   | UpdateToolsetResponseMessage
-  | CronListResponseMessage
-  | CronAddResponseMessage
-  | CronGetResponseMessage
-  | CronRunsResponseMessage
-  | CronTriggerResponseMessage
-  | CronUpdateResponseMessage
-  | CronDeleteResponseMessage
-  | CronDeleteAllResponseMessage
+  | CronProtocolResponseMessage
   | CronsUpdatedMessage
   | SkillEnableResponseMessage
   | SkillDisableResponseMessage
@@ -2877,7 +2653,8 @@ export type WsProtocolMessage =
   | ChannelPairingsUpdatedMessage
   | ChannelRoutesUpdatedMessage
   | ChannelTargetsUpdatedMessage
-  | GetCwdMapResponseMessage
+  | CwdProtocol.SetBootWorkingDirectoryResponseMessage
+  | CwdProtocol.GetCwdMapResponseMessage
   | SearchBranchesResponse
   | CheckoutBranchResponse
   | SecretListResponse

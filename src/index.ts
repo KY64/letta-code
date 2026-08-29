@@ -175,9 +175,7 @@ USAGE
   letta -p "..."        One-off prompt in headless mode (no TTY UI)
 
   # maintenance
-  letta update          Manually check for updates and install if available
-  letta upgrade         Alias for \`letta update\`
-  letta --update/--upgrade Aliases for \`letta update\`
+  letta update          Check for updates and install (aliases: upgrade, --update, --upgrade)
   letta memory ...      Memory filesystem subcommands
   letta agents ...      Agents subcommands (JSON-only)
   letta environments ... List available remote environments (JSON-only)
@@ -186,6 +184,7 @@ USAGE
   letta mods ...        List and manage local mods
   letta sandbox ...     Transfer files to or from the current Cloud sandbox
   letta server ...      Run a remote environment, channels, or the App Server
+  letta cloud-mcp ...  Use MCP servers connected to an agent
   letta connect ...     Connect providers from terminal
   letta backend ...     Show or set the default backend
   letta setup           Re-run first-run setup
@@ -208,7 +207,7 @@ SUBCOMMANDS
   letta agents list [--query <text> | --name <name> | --tags <tags>]
   letta environments list [--online-only]
   letta environments current
-  letta teleport list|cloud|<environment>
+  letta teleport list|cloud|local|<environment>
   letta messages search --query <text> [--all-agents]
   letta messages list [--agent <id>]
   letta messages transcript --conversation <id> [--out <path>]
@@ -217,6 +216,7 @@ SUBCOMMANDS
   letta mods enable <package-spec>
   letta mods disable <package-spec>
   letta mods remove <package-spec>
+  letta cloud-mcp list|tools|run ... [--agent <id>]
   letta server [--env-name <name> | --listen [url]] [options]
   letta connect <provider> [options]
   letta install <thing> [--agent <id> | -n <name>]
@@ -1122,10 +1122,10 @@ async function main(): Promise<void> {
   const isUsingLocalBackend = isExperimentalLocalBackendEnabled();
 
   if (!isUsingDevBackend && !isUsingLocalBackend) {
-    // Headless mode against Letta API requires an explicit LETTA_API_KEY env var.
-    // Stored interactive OAuth tokens are not accepted for automated/headless use.
+    // Ephemeral runs may reuse saved OAuth; other headless automation requires an env key.
     if (
       isHeadless &&
+      !values.ephemeral &&
       baseURL === LETTA_CLOUD_API_URL &&
       !process.env.LETTA_API_KEY
     ) {
@@ -1350,7 +1350,7 @@ async function main(): Promise<void> {
     specifiedAgentId = resolved.id;
     nameResolvedAgent = resolved.agent;
   }
-  await (await import("@/agent/remote-model-catalog")).refreshModelCatalog();
+  await (await import("@/agent/remote-model-catalog")).initializeModelCatalog();
   // Set tool filter if provided (controls which tools are loaded)
   if (values.tools !== undefined) {
     const { toolFilter } = await import("@/tools/filter");

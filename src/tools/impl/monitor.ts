@@ -24,6 +24,7 @@ import {
   getNextMonitorId,
   notifyBackgroundProcessStateChanged,
   scheduleBackgroundProcessCleanup,
+  scrubCompletedBackgroundOutput,
   unrefTimer,
 } from "./process_manager.js";
 import { getShellEnv } from "./shell-env.js";
@@ -101,31 +102,43 @@ function validUtf8Prefix(buffer: Buffer, maxBytes: number): Buffer {
 class MonitorOutputWriter {
   private bytesWritten = 0;
   private truncated = false;
+  private writeFailed = false;
 
   constructor(private readonly path: string) {}
 
-  append(text: string): void {
-    if (this.truncated || !text) return;
+  append(text: string): boolean {
+    if (this.truncated || this.writeFailed || !text) return true;
     const chunk = Buffer.from(text, "utf8");
     const remaining = MONITOR_OUTPUT_FILE_BYTES - this.bytesWritten;
     if (chunk.length <= remaining) {
-      appendFileSync(this.path, chunk);
+      try {
+        appendFileSync(this.path, chunk);
+      } catch {
+        this.writeFailed = true;
+        return false;
+      }
       this.bytesWritten += chunk.length;
-      return;
+      return true;
     }
 
     const marker = Buffer.from(
       `\n[output truncated at ${MONITOR_OUTPUT_FILE_BYTES} bytes]\n`,
       "utf8",
     );
-    const content = validUtf8Prefix(
-      Buffer.concat([readFileSync(this.path), chunk]),
-      MONITOR_OUTPUT_FILE_BYTES - marker.length,
-    );
-    const truncatedOutput = Buffer.concat([content, marker]);
-    writeFileSync(this.path, truncatedOutput);
-    this.bytesWritten = truncatedOutput.length;
-    this.truncated = true;
+    try {
+      const content = validUtf8Prefix(
+        Buffer.concat([readFileSync(this.path), chunk]),
+        MONITOR_OUTPUT_FILE_BYTES - marker.length,
+      );
+      const truncatedOutput = Buffer.concat([content, marker]);
+      writeFileSync(this.path, truncatedOutput);
+      this.bytesWritten = truncatedOutput.length;
+      this.truncated = true;
+    } catch {
+      this.writeFailed = true;
+      return false;
+    }
+    return true;
   }
 }
 
@@ -278,8 +291,11 @@ function rawDataToString(data: RawData): string {
   return data.toString("utf8");
 }
 
-function sanitizeMonitorText(text: string, agentId?: string): string {
-  return stripAnsi(scrubSecretsFromString(text, agentId));
+function sanitizeMonitorText(
+  text: string,
+  secrets: Readonly<Record<string, string>>,
+): string {
+  return stripAnsi(scrubSecretsFromString(text, secrets));
 }
 
 function queueMonitorEvent(params: {
@@ -287,9 +303,10 @@ function queueMonitorEvent(params: {
   description: string;
   event: string;
   scope: ReturnType<typeof resolveNotificationScope>;
+  secrets: Readonly<Record<string, string>>;
 }): void {
-  const { taskId, description, event, scope } = params;
-  const sanitizedEvent = sanitizeMonitorText(event, scope?.agentId);
+  const { taskId, description, event, scope, secrets } = params;
+  const sanitizedEvent = sanitizeMonitorText(event, secrets);
   addToMessageQueue({
     kind: "task_notification",
     text: formatMonitorEventNotification({
@@ -353,6 +370,7 @@ function markMonitorFinished(
 ): void {
   processState.status = status;
   processState.exitCode = exitCode;
+  scrubCompletedBackgroundOutput(processState);
   notifyBackgroundProcessStateChanged(processState.runtimeScope);
   scheduleBackgroundProcessCleanup(taskId);
 }
@@ -375,6 +393,7 @@ function startCommandMonitor(args: NormalizedMonitorArgs): MonitorResult {
   const outputFile = createBackgroundOutputFile(taskId);
   const output = new MonitorOutputWriter(outputFile);
   const scope = resolveNotificationScope(args.parentScope);
+  const secrets = args.secretEnv ?? {};
   let processState: BackgroundProcess;
 
   const events = createMonitorEventStream({
@@ -384,6 +403,7 @@ function startCommandMonitor(args: NormalizedMonitorArgs): MonitorResult {
         description: args.description,
         event,
         scope,
+        secrets,
       });
     },
     stopSource() {
@@ -403,11 +423,26 @@ function startCommandMonitor(args: NormalizedMonitorArgs): MonitorResult {
     captureOutput: false,
     onOutput(text, stream) {
       if (!processState) return;
-      const sanitizedText = sanitizeMonitorText(text, scope?.agentId);
+      const sanitizedText = sanitizeMonitorText(text, secrets);
       appendBackgroundProcessOutput(processState, stream, sanitizedText);
-      output.append(
+      const wrote = output.append(
         stream === "stderr" ? `[stderr] ${sanitizedText}` : sanitizedText,
       );
+      if (!wrote && processState.status === "running") {
+        appendBackgroundProcessOutput(
+          processState,
+          "stderr",
+          "[output file write failed; output may be incomplete]",
+        );
+        processState.completionNotificationSuppressed = true;
+        markMonitorFinished(taskId, processState, "failed", null);
+        try {
+          runningProcess.process.kill("SIGTERM");
+        } catch {
+          // Process may have already exited.
+        }
+        return;
+      }
       if (stream === "stdout") {
         events.onData(sanitizedText);
       }
@@ -440,6 +475,7 @@ function startCommandMonitor(args: NormalizedMonitorArgs): MonitorResult {
     description: args.description,
     monitorSource: "command",
     persistent: args.persistent,
+    secrets,
   };
   backgroundProcesses.set(taskId, processState);
   notifyBackgroundProcessStateChanged(scope);
@@ -477,12 +513,13 @@ function startCommandMonitor(args: NormalizedMonitorArgs): MonitorResult {
           description: args.description,
           event: "[Monitor timed out — re-arm if needed.]",
           scope,
+          secrets,
         });
         processState.completionNotificationSuppressed = true;
       } else {
         const message = sanitizeMonitorText(
           shellError.message || String(error),
-          scope?.agentId,
+          secrets,
         );
         appendBackgroundProcessOutput(processState, "stderr", message);
         output.append(`\n[error] ${message}\n`);
@@ -515,6 +552,7 @@ function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
   const outputFile = createBackgroundOutputFile(taskId);
   const output = new MonitorOutputWriter(outputFile);
   const scope = resolveNotificationScope(args.parentScope);
+  const secrets: Readonly<Record<string, string>> = {};
   const socket = new WebSocket(source.url, source.protocols, {
     maxPayload: WEBSOCKET_MAX_PAYLOAD_BYTES,
   });
@@ -541,6 +579,7 @@ function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
         description: args.description,
         event,
         scope,
+        secrets,
       });
     },
     stopSource() {
@@ -574,6 +613,7 @@ function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
     description: args.description,
     monitorSource: "websocket",
     persistent: args.persistent,
+    secrets,
   };
   backgroundProcesses.set(taskId, processState);
   notifyBackgroundProcessStateChanged(scope);
@@ -596,6 +636,7 @@ function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
         description: args.description,
         event,
         scope,
+        secrets,
       });
       processState.completionNotificationSuppressed = true;
       markMonitorFinished(taskId, processState, "failed", null);
@@ -605,10 +646,21 @@ function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
 
     const text = sanitizeMonitorText(
       isBinary ? `[binary frame, ${byteLength} bytes]` : rawDataToString(data),
-      scope?.agentId,
+      secrets,
     );
     appendBackgroundProcessOutput(processState, "stdout", text);
-    output.append(`${text}\n`);
+    const wrote = output.append(`${text}\n`);
+    if (!wrote) {
+      appendBackgroundProcessOutput(
+        processState,
+        "stderr",
+        "[output file write failed; output may be incomplete]",
+      );
+      processState.completionNotificationSuppressed = true;
+      markMonitorFinished(taskId, processState, "failed", null);
+      closeSocket();
+      return;
+    }
     events.onData(`${text}\n`);
   });
 
@@ -620,7 +672,7 @@ function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
       return;
     }
     sawSocketError = true;
-    const message = sanitizeMonitorText(error.message, scope?.agentId);
+    const message = sanitizeMonitorText(error.message, secrets);
     const event = `[WebSocket error: ${message}]`;
     appendBackgroundProcessOutput(processState, "stderr", message);
     output.append(`[stderr] ${message}\n`);
@@ -629,6 +681,7 @@ function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
       description: args.description,
       event,
       scope,
+      secrets,
     });
     closeSocket();
   });
@@ -646,10 +699,7 @@ function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
     }
     events.finish();
     if (processState.status !== "running") return;
-    const closeReason = sanitizeMonitorText(
-      reason.toString("utf8"),
-      scope?.agentId,
-    );
+    const closeReason = sanitizeMonitorText(reason.toString("utf8"), secrets);
     const reasonSuffix = closeReason ? ` ${closeReason}` : "";
     const event = `[WebSocket closed: ${code}${reasonSuffix}]`;
     output.append(`${event}\n`);
@@ -658,6 +708,7 @@ function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
       description: args.description,
       event,
       scope,
+      secrets,
     });
     markMonitorFinished(
       taskId,
@@ -677,6 +728,7 @@ function startWebSocketMonitor(args: NormalizedMonitorArgs): MonitorResult {
         description: args.description,
         event: "[Monitor timed out — re-arm if needed.]",
         scope,
+        secrets,
       });
       output.append(`\n[timeout after ${args.timeout_ms}ms]\n`);
       processState.completionNotificationSuppressed = true;

@@ -153,10 +153,12 @@ describe("listener protocol ergonomics", () => {
       request_id: "probe-1",
       runtime: { agent_id: "agent-1", conversation_id: "conv-1" },
       supported: true,
+      drains_accepted_inputs: true,
+      idempotent_continuation: true,
     });
   });
 
-  test("teleport continuation resumes with tool results and no user message", async () => {
+  test("teleport continuation resumes with tool results and hidden destination context", async () => {
     const runtime = __listenClientTestUtils.createListenerRuntime();
     const conversationRuntime =
       __listenClientTestUtils.getOrCreateScopedRuntime(
@@ -219,9 +221,10 @@ describe("listener protocol ergonomics", () => {
       disposition: "started",
     });
     const incoming = receivedIncoming[0];
-    expect(incoming?.messages).toHaveLength(1);
+    expect(incoming?.messages).toHaveLength(2);
     expect(incoming?.messages[0]).toMatchObject({
       type: "approval",
+      otid: "teleport-1",
       approvals: [
         {
           type: "tool",
@@ -231,7 +234,17 @@ describe("listener protocol ergonomics", () => {
         },
       ],
     });
-    expect(incoming?.messages.some((message) => "role" in message)).toBe(false);
+    expect(incoming?.messages[1]).toEqual({
+      role: "system",
+      content:
+        "<system-reminder>Teleportation to this environment is complete. Continue the existing task from this environment now.</system-reminder>",
+      otid: "teleport-1:continue",
+    });
+    expect(
+      incoming?.messages.some(
+        (message) => "role" in message && message.role === "user",
+      ),
+    ).toBe(false);
   });
 
   test("sync request_id gets a failure response when the listener is inactive", async () => {

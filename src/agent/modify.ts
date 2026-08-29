@@ -13,6 +13,7 @@ import { getBackend } from "@/backend";
 import { OPENAI_CODEX_PROVIDER_NAME } from "@/providers/openai-codex-provider";
 import { debugLog } from "@/utils/debug";
 import { OPENAI_COMPATIBLE_PROXY_UPDATE_ARG } from "@/utils/openai-endpoint";
+import { normalizeReasoningEffortForModel } from "@/utils/openai-reasoning-effort";
 import { isRecord } from "@/utils/type-guards";
 import { getModelContextWindow } from "./available-models";
 import { getModelInfo, type ModelReasoningSelection } from "./model";
@@ -107,7 +108,12 @@ function buildModelSettings(
       (openaiSettings as Record<string, unknown>).reasoning =
         updateArgs.reasoning_effort === null
           ? null
-          : { reasoning_effort: updateArgs.reasoning_effort };
+          : {
+              reasoning_effort: normalizeReasoningEffortForModel(
+                modelHandle,
+                String(updateArgs.reasoning_effort),
+              ),
+            };
     }
     const verbosity = updateArgs?.verbosity;
     if (verbosity === "low" || verbosity === "medium" || verbosity === "high") {
@@ -244,7 +250,12 @@ function buildModelSettings(
       (openaiProxySettings as Record<string, unknown>).reasoning =
         updateArgs.reasoning_effort === null
           ? null
-          : { reasoning_effort: updateArgs.reasoning_effort };
+          : {
+              reasoning_effort: normalizeReasoningEffortForModel(
+                modelHandle,
+                String(updateArgs.reasoning_effort),
+              ),
+            };
     }
     if (typeof updateArgs?.strict === "boolean") {
       (openaiProxySettings as Record<string, unknown>).strict =
@@ -742,17 +753,12 @@ export async function updateAgentSystemPrompt(
     const { resolveAndBuildSystemPrompt } = await import(
       "@/agent/system-prompt-resolution"
     );
-    const { recordManagedSystemPrompt } = await import(
-      "@/agent/system-prompt-versioning"
-    );
+    const { getMemoryPromptModeForAgent, recordManagedSystemPrompt } =
+      await import("@/agent/system-prompt-versioning");
     const { settingsManager } = await import("@/settings-manager");
 
     const backend = getBackend();
-    const memoryMode = backend.capabilities.localMemfs
-      ? "local-memfs"
-      : settingsManager.isReady && settingsManager.isMemfsEnabled(agentId)
-        ? "memfs"
-        : "standard";
+    const memoryMode = getMemoryPromptModeForAgent(agentId);
 
     const systemPromptContent = await resolveAndBuildSystemPrompt(
       systemPromptId,
@@ -822,16 +828,19 @@ export async function updateAgentSystemPromptMemfs(
 ): Promise<SystemPromptUpdateResult> {
   try {
     const { settingsManager } = await import("@/settings-manager");
-    const { isKnownPreset, buildSystemPrompt } = await import(
-      "@/agent/prompt-assets"
-    );
-    const { hashSystemPrompt, recordManagedSystemPrompt } = await import(
-      "@/agent/system-prompt-versioning"
-    );
+    const {
+      isKnownPreset,
+      buildSystemPrompt,
+      getSystemPromptVariantContents,
+      SYSTEM_PROMPTS,
+    } = await import("@/agent/prompt-assets");
+    const {
+      getMemoryPromptModeForAgent,
+      hashSystemPrompt,
+      recordManagedSystemPrompt,
+    } = await import("@/agent/system-prompt-versioning");
 
-    const newMode = getBackend().capabilities.localMemfs
-      ? "local-memfs"
-      : "memfs";
+    const newMode = getMemoryPromptModeForAgent(agentId);
     const storedPreset = settingsManager.isReady
       ? settingsManager.getSystemPromptPreset(agentId)
       : undefined;
@@ -854,14 +863,15 @@ export async function updateAgentSystemPromptMemfs(
       }
 
       if (!storedHash && settingsManager.isReady) {
-        const currentMode = settingsManager.isMemfsEnabled(agentId)
-          ? getBackend().capabilities.localMemfs
-            ? "local-memfs"
-            : "memfs"
-          : "standard";
-        if (
-          currentSystemPrompt !== buildSystemPrompt(storedPreset, currentMode)
-        ) {
+        const preset = SYSTEM_PROMPTS.find(
+          (candidate) => candidate.id === storedPreset,
+        );
+        const matchesBundledVariant =
+          preset &&
+          getSystemPromptVariantContents(preset).some(
+            (content) => content.trim() === currentSystemPrompt.trim(),
+          );
+        if (!matchesBundledVariant) {
           settingsManager.setSystemPromptCustom(agentId);
           return {
             success: true,

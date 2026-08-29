@@ -9,7 +9,6 @@ import {
   type ModelsJson,
   type Verdict,
 } from "./diff-models-json.ts";
-import type { PathChangeSummary, RenderInput } from "./render-issue.ts";
 
 export const CODEX_REPO = "openai/codex";
 export const DEFAULT_TARGET_REPO =
@@ -35,11 +34,26 @@ export interface Release {
 export interface AnalyzeCodexReleaseOptions {
   sinceTag: string | null;
   currentTag: string | null;
+  stableReleases?: Release[];
 }
 
-export interface CodexWatchAnalysis extends RenderInput {
+export interface PathChangeSummary {
+  path: string;
+  commits: string[];
+}
+
+export interface CodexWatchAnalysis {
+  previous_tag: string;
+  current_tag: string;
+  is_latest_release: boolean;
+  release_url: string;
+  release_notes_md: string;
   verdict: Verdict;
   models_diff: ModelsDiff | null;
+  prompt_md_changed: boolean;
+  prompt_md_diff_preview: string | null;
+  path_changes: PathChangeSummary[];
+  workflow_run_url: string;
   compare_url: string;
   changed_files: string[];
 }
@@ -47,7 +61,7 @@ export interface CodexWatchAnalysis extends RenderInput {
 export async function analyzeCodexRelease(
   options: AnalyzeCodexReleaseOptions,
 ): Promise<CodexWatchAnalysis> {
-  const stables = await listStableReleases();
+  const stables = options.stableReleases ?? (await listStableReleases());
   if (stables.length === 0) throw new Error("No stable Codex releases found");
 
   const current = options.currentTag
@@ -125,8 +139,13 @@ export async function analyzeCodexRelease(
     return {
       previous_tag: previous.tag_name,
       current_tag: current.tag_name,
+      is_latest_release: current.tag_name === stables.at(-1)?.tag_name,
       release_url: current.html_url,
-      release_notes_md: current.body ?? "",
+      release_notes_md: releaseNotesForRange(
+        stables,
+        previous.tag_name,
+        current.tag_name,
+      ),
       verdict,
       models_diff: modelsDiff,
       prompt_md_changed: promptMdChanged,
@@ -186,6 +205,49 @@ function findPreviousStable(
   const idx = stables.findIndex((r) => r.tag_name === currentTag);
   if (idx <= 0) return null;
   return stables[idx - 1] ?? null;
+}
+
+export function releaseNotesForRange(
+  stables: Release[],
+  previousTag: string,
+  currentTag: string,
+): string {
+  const currentIndex = stables.findIndex(
+    (release) => release.tag_name === currentTag,
+  );
+  if (currentIndex < 0) {
+    throw new Error(`Could not find current release ${currentTag}`);
+  }
+  const previousIndex = stables.findIndex(
+    (release) => release.tag_name === previousTag,
+  );
+  if (previousIndex >= currentIndex) {
+    throw new Error(
+      `Previous release ${previousTag} must precede ${currentTag}`,
+    );
+  }
+  const firstIncludedIndex =
+    previousIndex < 0 ? currentIndex : previousIndex + 1;
+  return stables
+    .slice(firstIncludedIndex, currentIndex + 1)
+    .map(
+      (release) =>
+        `## [${release.tag_name}](${release.html_url})\n\n${release.body?.trim() || "_No release notes._"}`,
+    )
+    .join("\n\n");
+}
+
+export function findLatestStableReleaseAfter(
+  stables: Release[],
+  terminalTag: string,
+): Release | null {
+  const terminalIndex = stables.findIndex(
+    (release) => release.tag_name === terminalTag,
+  );
+  if (terminalIndex < 0) {
+    throw new Error(`Could not find terminal release ${terminalTag}`);
+  }
+  return terminalIndex === stables.length - 1 ? null : (stables.at(-1) ?? null);
 }
 
 function cloneCodex(tmp: string): string {

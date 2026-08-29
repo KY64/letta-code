@@ -1,9 +1,9 @@
 import { runAgentsSubcommand } from "./agents";
 import { runBackendSubcommand } from "./backend";
 import { runChannelsSubcommand } from "./channels";
+import { runCloudMcpSubcommand } from "./cloud-mcp";
 import { runConnectSubcommand } from "./connect";
 import { runCronSubcommand } from "./cron";
-import { runDreamSubcommand } from "./dream";
 import { runEnvironmentsSubcommand } from "./environments";
 import { runListenSubcommand } from "./listen.tsx";
 import { runLocalBackendSubcommand } from "./local-backend";
@@ -11,6 +11,7 @@ import { runMemorySubcommand } from "./memory";
 import { runMessagesSubcommand } from "./messages";
 import { runModsSubcommand } from "./mods";
 import { runSandboxSubcommand } from "./sandbox";
+import { runSecretSubcommand } from "./secret";
 import { asLegacyAppServerCommand, runServerSubcommand } from "./server";
 import { runSetupSubcommand } from "./setup";
 import { runSharedMemorySubcommand } from "./shared-memory";
@@ -39,7 +40,6 @@ export function subcommandNeedsEarlyBackendMode(
     case "channel-gateway":
     case "agents":
     case "connect":
-    case "dream":
     case "environments":
     case "envs":
     case "install":
@@ -49,7 +49,9 @@ export function subcommandNeedsEarlyBackendMode(
     case "mods":
     case "remote":
     case "sandbox":
+    case "secret":
     case "server":
+    case "cloud-mcp":
     case "shared-memory":
     case "skills":
     case "teleport":
@@ -91,10 +93,14 @@ export async function runSubcommand(argv: string[]): Promise<number | null> {
       return runModsSubcommand(rest);
     case "sandbox":
       return runSandboxSubcommand(rest);
+    case "secret":
+      return runSecretSubcommand(rest);
     case "teleport":
       return runTeleportSubcommand(rest);
     case "server":
       return runServerSubcommand(rest);
+    case "cloud-mcp":
+      return runCloudMcpSubcommand(rest);
     case "remote": // alias
       return runListenSubcommand(rest);
     case "connect":
@@ -111,8 +117,6 @@ export async function runSubcommand(argv: string[]): Promise<number | null> {
       return runSkillsSubcommand(rest);
     case "cron":
       return runCronSubcommand(rest);
-    case "dream":
-      return runDreamSubcommand(rest);
     case "channels":
       return runChannelsSubcommand(rest);
     case "channel-gateway": {

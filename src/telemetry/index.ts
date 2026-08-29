@@ -8,6 +8,11 @@ import { settingsManager } from "@/settings-manager";
 import { debugLogFile } from "@/utils/debug";
 import { isLoopbackHostname, parseUrl } from "@/utils/url";
 import { getVersion } from "@/version";
+import {
+  resolveTelemetryAgentOrigin,
+  type TelemetryAgentOrigin,
+} from "./agent-origin";
+import { installFatalErrorHandlers } from "./fatal-error-handler";
 
 export type TelemetrySurface =
   | "letta_code_tui"
@@ -272,6 +277,7 @@ class TelemetryManager {
   private sessionId: string;
   private deviceId: string | null = null;
   private currentAgentId: string | null = null;
+  private currentAgentOrigin: TelemetryAgentOrigin | null = null;
   private surface: TelemetrySurface = "letta_code_tui";
   private sessionStartTime: number;
   private messageCount = 0;
@@ -279,6 +285,8 @@ class TelemetryManager {
   private sessionEndTracked = false;
   private initialized = false;
   private flushInterval: NodeJS.Timeout | null = null;
+  private removeSigintHandler: (() => void) | null = null;
+  private removeFatalErrorHandlers: (() => void) | null = null;
   private serverVersion: string | null = null;
   /** Deduplicates concurrent flushes (prevents the 429 double-flush race on shutdown). */
   private inflightFlush: Promise<void> | null = null;
@@ -413,7 +421,7 @@ class TelemetryManager {
 
     if (options.handleSigint !== false) {
       // Await drain() (bounded by DRAIN_TIMEOUT_MS) so the final batch ships before exit.
-      process.on("SIGINT", () => {
+      const sigintHandler = () => {
         void (async () => {
           try {
             this.trackSessionEnd(undefined, "sigint");
@@ -423,53 +431,23 @@ class TelemetryManager {
           }
           process.exit(0);
         })();
-      });
+      };
+      process.on("SIGINT", sigintHandler);
+      this.removeSigintHandler = () => {
+        process.off("SIGINT", sigintHandler);
+      };
     }
 
-    process.on("uncaughtException", (error) => {
-      void (async () => {
-        try {
-          const msg = error instanceof Error ? error.message : String(error);
-          // Broken pipe/TTY — not actionable (e.g. terminal closed while writing)
-          if (/\b(EPIPE|EIO|EBADF)\b/.test(msg)) return;
-          this.trackError(
-            "uncaught_exception",
-            msg,
-            "process_uncaught_exception",
-          );
-          await this.drain();
-        } catch {
-          // Silently ignore - don't prevent process from exiting
-        }
-      })();
+    this.removeFatalErrorHandlers = installFatalErrorHandlers({
+      drain: () => this.drain(),
+      trackError: (errorType, message, context) => {
+        this.trackError(errorType, message, context);
+      },
     });
 
-    process.on("unhandledRejection", (reason) => {
-      void (async () => {
-        try {
-          const msg = reason instanceof Error ? reason.message : String(reason);
-          // Broken pipe/TTY — not actionable
-          if (/\b(EPIPE|EIO|EBADF)\b/.test(msg)) return;
-          // Rate limits surfacing as unhandled rejections — expected under load
-          if (/\b429\b/.test(msg) && /rate.?limit/i.test(msg)) return;
-          this.trackError(
-            "unhandled_rejection",
-            msg,
-            "process_unhandled_rejection",
-          );
-          await this.drain();
-        } catch {
-          // Silently ignore - don't prevent process from exiting
-        }
-      })();
-    });
-
-    // TODO: Add telemetry for crashes and abnormal exits
-    // Current limitation: We can't reliably flush telemetry on process.on("exit")
-    // because the event loop is shut down and async operations don't work.
-    // Potential solution: Write unsent events to ~/.letta/telemetry-queue.json
-    // and send them on next startup. This would capture crash telemetry without
-    // risking hangs on exit.
+    // Fatal handlers can only make a bounded flush attempt. Persisting unsent
+    // events for delivery on the next startup would make crash telemetry more
+    // reliable without extending the fatal shutdown deadline.
   }
 
   /**
@@ -500,6 +478,7 @@ class TelemetryManager {
         ...data,
         session_id: this.sessionId,
         agent_id: this.currentAgentId || undefined,
+        agent_origin: this.currentAgentOrigin || undefined,
         surface: this.surface,
         backend: resolveTelemetryBackend(),
       },
@@ -523,6 +502,35 @@ class TelemetryManager {
    */
   setCurrentAgentId(agentId: string | null) {
     this.currentAgentId = agentId;
+    this.currentAgentOrigin = null;
+  }
+
+  /**
+   * Attach safe analytics fields from an agent that the caller already loaded.
+   * Events queued during startup are enriched without another API request.
+   */
+  setCurrentAgent(
+    agentId: string | null,
+    tags: readonly string[] | null | undefined,
+  ) {
+    this.currentAgentId = agentId;
+    this.currentAgentOrigin = agentId
+      ? (resolveTelemetryAgentOrigin(tags) ?? null)
+      : null;
+
+    if (!agentId) {
+      return;
+    }
+
+    for (const event of this.events) {
+      if (event.data.agent_id && event.data.agent_id !== agentId) {
+        continue;
+      }
+      event.data.agent_id = agentId;
+      if (this.currentAgentOrigin) {
+        event.data.agent_origin = this.currentAgentOrigin;
+      }
+    }
   }
 
   setSurface(surface: TelemetrySurface) {
@@ -911,6 +919,10 @@ class TelemetryManager {
    * Clean up resources
    */
   cleanup() {
+    this.removeSigintHandler?.();
+    this.removeSigintHandler = null;
+    this.removeFatalErrorHandlers?.();
+    this.removeFatalErrorHandlers = null;
     if (this.flushInterval) {
       clearInterval(this.flushInterval);
       this.flushInterval = null;

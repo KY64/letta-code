@@ -257,7 +257,7 @@ export function getRepositoryMountDir(
   return join(dirname(getMemoryRepoDir(agentId)), repositoryName);
 }
 
-function validateAgentRepositoryName(name: string): string {
+export function validateAgentRepositoryName(name: string): string {
   const trimmed = name.trim();
   if (!trimmed) {
     throw new Error("repository name is required");
@@ -808,7 +808,7 @@ export async function setLocalGitConfig(
   key: string,
   value: string,
 ): Promise<void> {
-  await gitConfig(dir, ["config", "--local", key, value]);
+  await gitConfig(dir, ["config", "--local", "--replace-all", key, value]);
 }
 
 /** Unset a local-scoped git config value. Ignores "not set" errors. */
@@ -860,17 +860,7 @@ async function fetchAgentDisplayName(agentId: string): Promise<string | null> {
   }
 }
 
-/**
- * Ensure the memfs repo has canonical local git config:
- *   - `letta.agentId` reconciled to the current agent id (always)
- *   - `user.email` = `<agentId>@letta.com` (only if unset — user overrides preserved)
- *   - `user.name`  = agent display name (only if unset — user overrides preserved)
- *
- * Without this, direct `git commit` from the agent's shell falls back to the
- * operator's global git identity (e.g. "Sarah Wooders"), producing mixed
- * attribution in `git log`. The memory tool path already passes explicit
- * `-c user.name=.. -c user.email=..` overrides, so it's unaffected.
- */
+/** Ensure local main tracks only origin/main and direct commits use the agent identity. */
 export async function ensureLocalMemfsGitConfig(
   dir: string,
   agentId: string,
@@ -885,6 +875,10 @@ export async function ensureLocalMemfsGitConfig(
     if (currentAgentId !== agentId) {
       await setLocalGitConfig(dir, "letta.agentId", agentId);
     }
+
+    // Duplicate merge values make both pull modes fail.
+    await setLocalGitConfig(dir, "branch.main.remote", "origin");
+    await setLocalGitConfig(dir, "branch.main.merge", "refs/heads/main");
 
     // Respect user overrides: only set identity when unset locally.
     const currentEmail = await getLocalGitConfig(dir, "user.email");
@@ -1098,7 +1092,7 @@ async function prepareMemoryRepoForGitOps(
 ): Promise<void> {
   await maybeUpdateMemoryRemoteOrigin(memoryDir, agentId);
   await configureLocalCredentialHelper(memoryDir, token);
-  installPreCommitHook(memoryDir);
+  installPreCommitHook(memoryDir, true);
   installPostCommitHook(memoryDir);
   await ensureLocalMemfsGitConfig(memoryDir, agentId);
 }
@@ -1386,7 +1380,6 @@ export async function commitMemoryWrite(
   };
 }
 
-/** Check if the memory directory is a git repo */
 export function isGitRepo(agentId: string): boolean {
   return existsSync(join(getScopedMemoryFilesystemRoot(agentId), ".git"));
 }
@@ -1444,6 +1437,7 @@ export async function initializeLocalMemoryRepo(
     authorEmail: `${params.agentId}@letta.com`,
   };
   await prepareLocalOnlyMemoryRepoForGitOps(params.memoryDir, author);
+  installPreCommitHook(params.memoryDir);
 
   if (await hasMemoryHead(params.memoryDir)) {
     return;
@@ -1511,7 +1505,7 @@ export interface SyncAgentRepositoriesResult {
   summaries: string[];
 }
 
-async function listAttachedAgentRepositories(
+export async function listAttachedAgentRepositories(
   agentId: string,
 ): Promise<AttachedAgentRepository[]> {
   const response = await apiRequest<AgentRepositoryResponse>(
@@ -1680,7 +1674,7 @@ export async function cloneMemoryRepo(agentId: string): Promise<void> {
   await configureLocalCredentialHelper(dir, token);
 
   // Install commit hooks (pre-commit validates frontmatter; post-commit mirrors)
-  installPreCommitHook(dir);
+  installPreCommitHook(dir, true);
   installPostCommitHook(dir);
 
   // Set canonical local git identity (letta.agentId, user.email, user.name)
@@ -1708,7 +1702,7 @@ export async function pullMemory(
 
   // Self-healing: ensure credential helper, hooks, and identity config are current
   await configureLocalCredentialHelper(dir, token);
-  installPreCommitHook(dir);
+  installPreCommitHook(dir, true);
   installPostCommitHook(dir);
   await ensureLocalMemfsGitConfig(dir, agentId);
 

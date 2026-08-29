@@ -48,6 +48,7 @@ import { getBackend, isLocalBackendEnabled } from "@/backend";
 import { getClient } from "@/backend/api/client";
 import { getBillingTier } from "@/backend/api/metadata";
 import { subscribePiProviderRegistry } from "@/backend/dev/pi-provider-mod-registry";
+import { useConversationTitleSync } from "@/cli/app/conversation-title-sync";
 import {
   cancelActiveConnectOperation,
   isActiveConnectOperationCancellable,
@@ -368,9 +369,8 @@ export function App({
   systemInfoReminderEnabled = true,
   modsDisabled = false,
 }: AppProps) {
-  // Warm the model-access cache in the background so /model is fast on first
-  // open, and refresh the curated catalog from the cloud endpoint (bundled
-  // models.json stays as the offline/failure fallback).
+  // Warm model availability so /model is fast on first open, and refresh the
+  // runtime catalog. API mode keeps its persisted catalog on temporary failures.
   useEffect(() => {
     prefetchAvailableModelHandles();
     prefetchModelCatalog();
@@ -403,12 +403,10 @@ export function App({
   }, [agentState]);
 
   const projectDirectory = process.cwd();
-
   const [conversationId, setConversationId] = useState(initialConversationId);
   const [conversationSummary, setConversationSummary] = useState<string | null>(
     null,
   );
-
   // Keep a ref to the current agentId for use in callbacks that need the latest value
   const agentIdRef = useRef(agentId);
   useEffect(() => {
@@ -1235,6 +1233,7 @@ export function App({
     },
     [],
   );
+  useConversationTitleSync(conversationId, setConversationSummary);
   const deriveAutoConversationTitle = useCallback(() => {
     if (firstUserQueryRef.current) {
       return firstUserQueryRef.current;
@@ -1398,8 +1397,9 @@ export function App({
   // Retry counter for transient LLM API errors (ref for synchronous access in loop)
   const llmApiErrorRetriesRef = useRef(0);
   const quotaAutoSwapAttemptedRef = useRef(false);
-  const providerFallbackAttemptedRef = useRef(false);
   const emptyResponseRetriesRef = useRef(0);
+  // Per-turn ChatGPT plan rotation counter (max swaps per turn)
+  const chatgptPlanSwapsRef = useRef(0);
 
   // Retry counter for 409 "conversation busy" errors
   const conversationBusyRetriesRef = useRef(0);
@@ -3766,6 +3766,7 @@ export function App({
     autoAllowedExecutionRef,
     buffersRef,
     clearApprovalToolContext,
+    chatgptPlanSwapsRef,
     closeTrajectorySegment,
     consumeQueuedMessages,
     queueModeRef,
@@ -3795,7 +3796,6 @@ export function App({
     precomputedDiffsRef,
     prepareScopedToolExecutionContext,
     processingConversationRef,
-    providerFallbackAttemptedRef,
     queueApprovalResults,
     queueSnapshotRef,
     quotaAutoSwapAttemptedRef,

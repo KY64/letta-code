@@ -5,6 +5,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import type { ReactionType } from "@grammyjs/types";
 import type { Context as GrammYContext } from "grammy";
 import {
   createInboundDebouncer,
@@ -26,10 +27,12 @@ import type {
   OutboundChannelRichMessageDraft,
   TelegramChannelAccount,
 } from "@/channels/types";
+import { normalizeTelegramChatId } from "./chat-id";
 import {
   buildTelegramDebounceKey,
   resolveTelegramInboundDebounceMs,
 } from "./debounce";
+import { diffTelegramReactionUpdate } from "./ingress";
 import type {
   BufferedMediaGroup,
   GrammYModule,
@@ -71,7 +74,6 @@ import {
   getTelegramMessageThreadId,
   getTelegramReactionSenderId,
   getTelegramReactionSenderName,
-  getTelegramReactionToken,
   getTelegramReplyContext,
   parseTelegramReactionInput,
   resolveTelegramBotConstructor,
@@ -340,30 +342,7 @@ export function createTelegramAdapter(
         return;
       }
 
-      const oldTokens = new Set(
-        update.old_reaction
-          .map((reaction) => getTelegramReactionToken(reaction))
-          .filter((value): value is string => typeof value === "string"),
-      );
-      const newTokens = new Set(
-        update.new_reaction
-          .map((reaction) => getTelegramReactionToken(reaction))
-          .filter((value): value is string => typeof value === "string"),
-      );
-
-      const events: Array<{ action: "added" | "removed"; emoji: string }> = [];
-
-      for (const emoji of oldTokens) {
-        if (!newTokens.has(emoji)) {
-          events.push({ action: "removed", emoji });
-        }
-      }
-
-      for (const emoji of newTokens) {
-        if (!oldTokens.has(emoji)) {
-          events.push({ action: "added", emoji });
-        }
-      }
+      const events = diffTelegramReactionUpdate(update);
 
       for (const event of events) {
         try {
@@ -545,11 +524,11 @@ export function createTelegramAdapter(
 
   async function sendLifecycleErrorReply(
     source: ChannelTurnSource,
+    dedupeKey: string,
     errorText: string,
     runId?: string | null,
   ): Promise<void> {
-    const key = getTelegramLifecycleErrorReplyKey(source);
-    if (!key || !rememberLifecycleErrorReply(key)) {
+    if (!rememberLifecycleErrorReply(dedupeKey)) {
       return;
     }
 
@@ -698,6 +677,7 @@ export function createTelegramAdapter(
     async sendRichMessageDraft(
       draft: OutboundChannelRichMessageDraft,
     ): Promise<void> {
+      normalizeTelegramChatId(draft.chatId);
       const telegramBot = await ensureBot();
       const raw = telegramBot.api.raw as unknown as TelegramRichMessageRawApi;
       await raw.sendRichMessageDraft(
@@ -708,6 +688,7 @@ export function createTelegramAdapter(
     async sendMessage(
       msg: OutboundChannelMessage,
     ): Promise<{ messageId: string }> {
+      normalizeTelegramChatId(msg.chatId);
       const telegramBot = await ensureBot();
 
       if (msg.reaction || msg.removeReaction) {
@@ -727,7 +708,7 @@ export function createTelegramAdapter(
           await telegramBot.api.setMessageReaction(
             msg.chatId,
             Number(targetMessageId),
-            [reaction],
+            [reaction as ReactionType],
           );
         } else {
           await telegramBot.api.setMessageReaction(
@@ -885,18 +866,26 @@ export function createTelegramAdapter(
 
       const uniqueSources = new Map<string, ChannelTurnSource>();
       for (const source of event.sources) {
-        const key = getTelegramLifecycleErrorReplyKey(source);
+        const key = getTelegramLifecycleErrorReplyKey(source, {
+          accountId: config.accountId,
+          batchId: event.batchId,
+          outcome: event.outcome,
+          runId: event.runId,
+        });
         if (!key || uniqueSources.has(key)) {
           continue;
         }
+        // Source order follows run ownership. Keep the first source as the
+        // causal Telegram reply target when one run consumed several messages.
         uniqueSources.set(key, source);
       }
 
       await Promise.all(
-        Array.from(uniqueSources.values()).map(async (source) => {
+        Array.from(uniqueSources.entries()).map(async ([key, source]) => {
           try {
             await sendLifecycleErrorReply(
               source,
+              key,
               event.error ?? "Turn failed",
               event.runId,
             );

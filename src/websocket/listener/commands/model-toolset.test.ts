@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
   clearAvailableModelsCache,
   getAvailableModelHandles,
@@ -7,6 +7,10 @@ import { models } from "@/agent/model";
 import type { Backend } from "@/backend";
 import { __testSetBackend } from "@/backend";
 import { FakeHeadlessBackend } from "@/backend/dev/fake-headless-backend";
+import {
+  clearRuntimeModelCatalogFixture,
+  installRuntimeModelCatalogFixture,
+} from "@/test-utils/runtime-model-catalog";
 import {
   buildListModelsResponse,
   resolveModelForUpdate,
@@ -49,12 +53,20 @@ class NativeCatalogBackend extends FakeHeadlessBackend {
         provider_type: "chatgpt_oauth",
         provider_category: "byok",
       },
+      {
+        handle: "openai-codex/gpt-5.6-sol",
+        display_name: "GPT-5.6 Sol",
+        provider_type: "chatgpt_oauth",
+        provider_category: "byok",
+      },
     ] as never;
   }
 }
 
 describe("listener native model selection", () => {
+  beforeEach(installRuntimeModelCatalogFixture);
   afterEach(() => {
+    clearRuntimeModelCatalogFixture();
     clearAvailableModelsCache();
     __testSetBackend(null);
   });
@@ -125,6 +137,18 @@ describe("listener native model selection", () => {
         reasoning_effort: null,
       })?.updateArgs,
     ).toBeUndefined();
+  });
+
+  test("honors device reasoning effort for a ChatGPT OAuth model", () => {
+    expect(
+      resolveModelForUpdate({
+        model_id: "gpt-5.6-sol-none",
+        model_handle: "openai-codex/gpt-5.6-sol",
+        reasoning_effort: "medium",
+      })?.updateArgs,
+    ).toMatchObject({
+      reasoning_effort: "medium",
+    });
   });
 
   test("preserves ChatGPT OAuth provider identity for native Fast aliases", async () => {

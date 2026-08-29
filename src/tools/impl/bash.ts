@@ -3,6 +3,7 @@ import {
   consumeWorkingDirectoryRecovery,
   getCurrentWorkingDirectory,
 } from "@/runtime-context";
+import { scrubSecretsFromString } from "@/tools/secret-substitution";
 import { addToMessageQueue } from "@/utils/message-queue-bridge.js";
 import {
   formatTaskNotification,
@@ -22,6 +23,7 @@ import {
   createBackgroundOutputFile,
   getNextBashId,
   scheduleBackgroundProcessCleanup,
+  scrubCompletedBackgroundOutput,
 } from "./process_manager.js";
 import { getShellEnv } from "./shell-env.js";
 import {
@@ -258,9 +260,12 @@ function notifyBackgroundCompletion(params: {
     : undefined;
 
   const { content: result } = truncateByChars(
-    [`$ ${bgProcess.command}`, detail, formatBackgroundOutputTail(bgProcess)]
-      .filter(Boolean)
-      .join("\n\n"),
+    scrubSecretsFromString(
+      [`$ ${bgProcess.command}`, detail, formatBackgroundOutputTail(bgProcess)]
+        .filter(Boolean)
+        .join("\n\n"),
+      bgProcess.secrets ?? {},
+    ),
     LIMITS.BASH_NOTIFICATION_CHARS,
     "Bash",
     { useMiddleTruncation: true },
@@ -313,6 +318,8 @@ export async function bash(args: BashArgs): Promise<BashResult> {
     parentScope,
   } = args;
   const userCwd = getCurrentWorkingDirectory();
+  const sanitizeOutput = (text: string) =>
+    scrubSecretsFromString(text, secretEnv ?? {});
 
   if (command === "/bg") {
     const processes = Array.from(backgroundProcesses.entries());
@@ -377,6 +384,7 @@ export async function bash(args: BashArgs): Promise<BashResult> {
     noteExpectedWorktreeForLauncher(launcher, userCwd);
     const sandboxed = applyShellSandbox(launcher, userCwd, bgEnv);
     let bgProcess: BackgroundProcess;
+    let outputWriteFailed = false;
     const runningProcess = startShellProcess(sandboxed.launcher, {
       cwd: userCwd,
       env: sandboxed.env,
@@ -384,11 +392,26 @@ export async function bash(args: BashArgs): Promise<BashResult> {
       sourceCommand: command,
       captureOutput: false,
       onOutput(text, stream) {
-        appendBackgroundProcessOutput(bgProcess, stream, text);
-        appendToOutputFile(
+        const sanitizedText = sanitizeOutput(text);
+        appendBackgroundProcessOutput(bgProcess, stream, sanitizedText);
+        const wrote = appendToOutputFile(
           outputFile,
-          stream === "stderr" ? `[stderr] ${text}` : text,
+          stream === "stderr" ? `[stderr] ${sanitizedText}` : sanitizedText,
         );
+        if (!wrote && bgProcess.status === "running") {
+          outputWriteFailed = true;
+          appendBackgroundProcessOutput(
+            bgProcess,
+            "stderr",
+            "[output file write failed; output may be incomplete]",
+          );
+          bgProcess.status = "failed";
+          try {
+            runningProcess.process.kill("SIGTERM");
+          } catch {
+            // Process may have already exited.
+          }
+        }
       },
     });
     bgProcess = {
@@ -404,6 +427,7 @@ export async function bash(args: BashArgs): Promise<BashResult> {
       totalStdoutLines: 0,
       totalStderrLines: 0,
       runtimeScope: parentScope,
+      secrets: secretEnv,
     };
     backgroundProcesses.set(bashId, bgProcess);
 
@@ -414,18 +438,21 @@ export async function bash(args: BashArgs): Promise<BashResult> {
 
     void runningProcess.completion.then(
       ({ exitCode }) => {
-        bgProcess.status = exitCode === 0 ? "completed" : "failed";
+        bgProcess.status =
+          exitCode === 0 && !outputWriteFailed ? "completed" : "failed";
         bgProcess.exitCode = exitCode;
         appendToOutputFile(outputFile, `\n[exit code: ${exitCode}]\n`);
+        scrubCompletedBackgroundOutput(bgProcess);
         notifyBackgroundCompletion({
           bashId,
           description,
           outputFile,
           bgProcess,
           scope: notificationScope,
-          status: exitCode === 0 ? "completed" : "failed",
-          detail:
-            exitCode === null
+          status: exitCode === 0 && !outputWriteFailed ? "completed" : "failed",
+          detail: outputWriteFailed
+            ? "Output file write failed; output may be incomplete"
+            : exitCode === null
               ? "Terminated by signal before exiting"
               : `Exit code: ${exitCode}`,
         });
@@ -433,9 +460,9 @@ export async function bash(args: BashArgs): Promise<BashResult> {
       },
       (error: unknown) => {
         const err = error as Error & { killed?: boolean };
-        const message = err.killed
-          ? `Command timed out after ${timeout}ms`
-          : err.message;
+        const message = sanitizeOutput(
+          err.killed ? `Command timed out after ${timeout}ms` : err.message,
+        );
         bgProcess.status = "failed";
         appendBackgroundProcessOutput(bgProcess, "stderr", message);
         appendToOutputFile(
@@ -444,6 +471,7 @@ export async function bash(args: BashArgs): Promise<BashResult> {
             ? `\n[timeout after ${timeout}ms]\n`
             : `\n[error] ${message}\n`,
         );
+        scrubCompletedBackgroundOutput(bgProcess);
         notifyBackgroundCompletion({
           bashId,
           description,
@@ -493,7 +521,7 @@ export async function bash(args: BashArgs): Promise<BashResult> {
       output || "(Command completed with no output)",
       LIMITS.BASH_OUTPUT_CHARS,
       "Bash",
-      { workingDirectory: userCwd, toolName: "Bash" },
+      { workingDirectory: userCwd, toolName: "Bash", secrets: secretEnv },
     );
 
     // Non-zero exit code is an error
@@ -546,7 +574,7 @@ export async function bash(args: BashArgs): Promise<BashResult> {
       errorMessage.trim() || "Command failed with unknown error",
       LIMITS.BASH_OUTPUT_CHARS,
       "Bash",
-      { workingDirectory: userCwd, toolName: "Bash" },
+      { workingDirectory: userCwd, toolName: "Bash", secrets: secretEnv },
     );
 
     return {

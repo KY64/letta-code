@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -229,6 +230,37 @@ describe("Monitor", () => {
     expect(output.message).toContain("warning");
   });
 
+  test("redacts split invocation secrets from notifications and stored output", async () => {
+    const secret = "he$$o";
+    const result = await monitor({
+      description: "secret output",
+      timeout_ms: 5000,
+      persistent: false,
+      command: nodeCommand(
+        "const value = process.env.PASSWORD ?? ''; process.stdout.write(value.slice(0, 2)); setTimeout(() => process.stdout.write(value.slice(2) + '\\n'), 25)",
+      ),
+      secretEnv: { PASSWORD: secret },
+    });
+
+    await waitFor(
+      () => backgroundProcesses.get(result.taskId)?.status === "completed",
+    );
+    const eventText = queuedMessages.map((message) => message.text).join("\n");
+    expect(eventText).toContain("PASSWORD=&lt;REDACTED&gt;");
+    expect(eventText).not.toContain(secret);
+
+    const output = await task_output({
+      task_id: result.taskId,
+      block: false,
+      timeout: 1000,
+    });
+    expect(output.message).toContain("PASSWORD=<REDACTED>");
+    expect(output.message).not.toContain(secret);
+
+    const outputFile = backgroundProcesses.get(result.taskId)?.outputFile;
+    expect(readFileSync(outputFile as string, "utf8")).not.toContain(secret);
+  });
+
   test("persistent command monitors can be stopped with TaskStop", async () => {
     const result = await monitor({
       description: "long process",
@@ -263,6 +295,25 @@ describe("Monitor", () => {
     expect(
       queuedMessages.some((message) => message.text.includes("Monitor event")),
     ).toBe(false);
+  });
+
+  test("fails a command monitor when its output file cannot be written", async () => {
+    const result = await monitor({
+      description: "output write failure",
+      timeout_ms: 5_000,
+      persistent: false,
+      command: nodeCommand(
+        'process.stdout.write("start\\n"); setTimeout(() => process.stdout.write("after\\n"), 1000); setTimeout(() => {}, 30000)',
+      ),
+    });
+    const processState = backgroundProcesses.get(result.taskId);
+    expect(processState?.outputFile).toBeDefined();
+    rmSync(processState?.outputFile ?? "", { force: true });
+    mkdirSync(processState?.outputFile ?? "");
+
+    await waitFor(
+      () => backgroundProcesses.get(result.taskId)?.status === "failed",
+    );
   });
 
   test("caps captured output files", async () => {
@@ -351,6 +402,51 @@ describe("Monitor", () => {
       expect(output.message).toContain("binary frame, 3 bytes");
       expect(output.message).toContain("[WebSocket closed: 1000 done]");
       expect(output.message).not.toContain("\u001b[31m");
+    } finally {
+      for (const client of server.clients) {
+        client.terminate();
+      }
+      server.close();
+    }
+  });
+
+  test("fails a WebSocket monitor when its output file cannot be written", async () => {
+    const server = new WebSocketServer({ host: "127.0.0.1", port: 0 });
+    await new Promise<void>((resolve) => server.once("listening", resolve));
+    const address = server.address();
+    if (!address || typeof address === "string") {
+      throw new Error("WebSocket test server did not expose a TCP port");
+    }
+    let sendFrame = (): void => {};
+    const connected = new Promise<void>((resolve) => {
+      server.once("connection", (socket) => {
+        sendFrame = () => socket.send("frame");
+        resolve();
+      });
+    });
+
+    try {
+      const result = await monitor({
+        description: "socket output write failure",
+        ws: { url: `ws://127.0.0.1:${address.port}` },
+      });
+      await connected;
+      const processState = backgroundProcesses.get(result.taskId);
+      expect(processState?.outputFile).toBeDefined();
+      rmSync(processState?.outputFile ?? "", { force: true });
+      mkdirSync(processState?.outputFile ?? "");
+
+      sendFrame();
+
+      await waitFor(
+        () => backgroundProcesses.get(result.taskId)?.status === "failed",
+      );
+      expect(
+        backgroundProcesses
+          .get(result.taskId)
+          ?.stderr.join("")
+          .includes("output file write failed"),
+      ).toBe(true);
     } finally {
       for (const client of server.clients) {
         client.terminate();

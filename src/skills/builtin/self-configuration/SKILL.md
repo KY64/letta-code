@@ -1,6 +1,6 @@
 ---
 name: self-configuration
-description: Inspect or modify Letta Code's own memory, model, context window, system prompt, compaction, permissions, toolsets, mods, skills, channels, schedules, and local runtime settings. Use when the user asks how this agent or conversation is configured, or asks you to change how you behave or how the harness runs you.
+description: Inspect or modify Letta Code's own memory, model, context window, system prompt, compaction, permissions, toolsets, mods, skills, channels, schedules, agent secrets, and local runtime settings. Use when the user asks how this agent or conversation is configured, or asks you to change how you behave or how the harness runs you.
 license: MIT
 ---
 
@@ -14,7 +14,7 @@ The important part is choosing the right layer. Do not smear a preference into d
 
 | Layer | Use it for | How to change it |
 | --- | --- | --- |
-| Memory and identity | Durable facts, style preferences, persona changes, project knowledge, reusable skills | Edit `$MEMORY_DIR` files and sync the memory repo |
+| Memory and identity | Facts worth retaining, style preferences, persona changes, project knowledge, reusable skills | Edit `$MEMORY_DIR` files and sync the memory repo |
 | Server agent fields | Default model, model settings, context limit, system prompt, compaction, agent name, description | Patch `/v1/agents/{agent_id}` |
 | Server conversation fields | Temporary model/context experiments for one conversation | Patch `/v1/conversations/{conversation_id}` |
 | Local settings | Permissions, environment variables, UI/runtime preferences, pinned agents, toolset overrides, reflection cadence | Edit `~/.letta/settings.json`, `./.letta/settings.json`, or `./.letta/settings.local.json` |
@@ -22,6 +22,7 @@ The important part is choosing the right layer. Do not smear a preference into d
 | Skills | Reusable procedural knowledge or bundled scripts | Load `creating-skills` or `acquiring-skills` |
 | Channels | Slack/Discord/Telegram/WhatsApp/Signal accounts, pairing, routing, listener state | Use `letta channels` or channel commands |
 | Schedules | Reminders and recurring prompts | Load `scheduling-tasks` and use `letta cron` |
+| Agent secrets | Per-agent `$NAME` credential values for shell commands | Use `letta secret` (or `/secret` in a session) |
 
 Decision rule: if the model should remember and reason about it, use memory. If the runtime must enforce it or route it before the model decides anything, use settings, API fields, mods, channels, or schedules.
 
@@ -87,15 +88,20 @@ If CLI behavior does not match the docs, stop and inspect `command -v letta`, `t
 
 Use memory when the user wants you to remember, prefer, learn, or change your identity/personality.
 
-Common files:
+Inspect the projected memory tree in the system prompt before choosing paths.
+Letta Code supports two layouts:
 
-| Path | Purpose |
-| --- | --- |
-| `$MEMORY_DIR/system/persona.md` | Identity, voice, behavioral defaults |
-| `$MEMORY_DIR/system/human.md` | Durable notes about the person you work with |
-| `$MEMORY_DIR/projects/` | Project-specific long-term context |
-| `$MEMORY_DIR/skills/` | Agent-owned reusable skills |
-| `$MEMORY_DIR/relationships/` | Durable relationship and collaboration notes |
+| Purpose | Root layout | Existing layout |
+| --- | --- | --- |
+| Identity and voice | `$MEMORY_DIR/persona.md` or another root persona file | `$MEMORY_DIR/system/persona.md` |
+| Notes about the user | `$MEMORY_DIR/human.md` or another root human file | `$MEMORY_DIR/system/human.md` |
+| Core memory | Other root Markdown files indexed by `MEMORY.md` | Markdown files under `$MEMORY_DIR/system/` |
+| Deferred memory | Directories with their own `MEMORY.md` | Files outside `$MEMORY_DIR/system/` |
+| Agent-owned skills | `$MEMORY_DIR/skills/` | `$MEMORY_DIR/skills/` |
+
+Use the active layout shown by the prompt and memory tools. Do not create a
+`system/` directory in a root-layout repository or move existing-layout memory
+to the root as part of an unrelated self-configuration request.
 
 After changing memory, inspect and commit the exact changed files. Push/sync according to the current harness reminder or the `syncing-memory-filesystem` skill; some environments sync committed memory automatically.
 
@@ -256,7 +262,11 @@ Selected global settings keys:
 | `preferredBackendMode` | Startup backend preference, `api` or `local` |
 | `channelCredentialsStore` | Channel token storage, `file`, `keyring`, or `auto` |
 | `reflectionTrigger` / `reflectionStepCount` | Default reflection cadence |
+| `reflectionMerge` / `reflectionMergeInstructions` | Reflection change integration policy |
 | `reflectionSettingsByAgent` | Per-agent reflection cadence |
+| `conversationSwitchAlertEnabled` | Send system-reminder when switching conversations/agents |
+| `createDefaultAgents` | Create Memo/Incognito default agents on startup (default: true) |
+| `windowTitle` | Configurable terminal window title fields |
 | `permissions` | Allow/deny/ask/alwaysAsk rules |
 | `env` | User-wide environment variables for Letta Code |
 | `experiments` | Feature flags |
@@ -270,7 +280,7 @@ Toolset values currently include `auto`, `default`, `codex`, `codex_snake`, `gem
 
 ## Permissions
 
-Permissions decide whether tool calls are allowed, denied, or require approval. User/global permission rules affect all agents using that settings file: `allow` can weaken review, while `deny` and `alwaysAsk` can brick workflows. Valid modes are `standard`, `acceptEdits`, and `unrestricted`; legacy `default` maps to `standard`, while `bypassPermissions` and `fullAccess` map to `unrestricted`. The default mode is `unrestricted` unless startup flags or settings override it.
+Permissions decide whether tool calls are allowed, denied, or require approval. User/global permission rules affect all agents using that settings file: `allow` can weaken review, while `deny` and `alwaysAsk` can brick workflows. Valid modes are `standard`, `acceptEdits`, `unrestricted`, and `strict`; legacy `default` maps to `standard`, while `bypassPermissions` and `fullAccess` map to `unrestricted`. The default mode is `unrestricted` unless startup flags or settings override it.
 
 The removed `memory` mode is invalid; memory access is governed by normal tool permissions plus the server/filesystem checks on the path used. These helper guardrails do not restrict raw Bash/API access. `permissions.mode` supplies a persisted startup default, rule lists still take precedence, and channel accounts have their own `defaultPermissionMode`. Inspect all three when channel approvals differ from the interactive CLI.
 
@@ -370,6 +380,24 @@ Never print provider keys. Shell expansion such as `--api-key "$OPENAI_API_KEY"`
 
 After connecting, verify the provider/model from the same backend and process that will run the agent. Do not infer success from a saved credential alone.
 
+## Agent secrets
+
+Agent-scoped secrets hold credential values that are referenced as `$NAME` in shell commands. Cloud agents store them server-side on the agent; local agents use OS secure storage. The harness substitutes `$NAME` at exec time and scrubs values from tool output, so values never enter agent context.
+
+```bash
+letta secret list                                   # names only, never values
+letta secret set GITHUB_TOKEN --env GITHUB_TOKEN    # ingest from the environment
+openssl rand -hex 32 | letta secret set WEBHOOK_TOKEN --stdin   # generate without seeing the value
+letta secret unset GITHUB_TOKEN                     # aliases: delete | remove | rm
+```
+
+Rules:
+
+- Pass the source variable *name* to `--env`, not `$NAME`. `--env $GITHUB_TOKEN` triggers harness substitution and places the resolved value in process arguments; `--env GITHUB_TOKEN` reads it from the CLI process environment without exposure.
+- Never echo secret values into tool output. Pipe generated credentials straight into `--stdin`.
+- Inside a session, `AGENT_ID`/`LETTA_AGENT_ID` resolves the target automatically; pass `--agent <agent-id>` otherwise.
+- A running session loads its secret cache at startup; CLI-side changes apply to new sessions. The `/secret` slash command manages the same store interactively and refreshes the live cache.
+
 ## Channels
 
 Use channels when the user wants to talk through Slack, Discord, Telegram, WhatsApp, or Signal.
@@ -423,7 +451,7 @@ letta --backend local
 letta --memfs
 ```
 
-Startup flags affect a new process only. They do not rewrite an already-running listener. Persist durable defaults in settings or server fields instead.
+Startup flags affect a new process only. They do not rewrite an already-running listener. Persist long-term defaults in settings or server fields instead.
 
 ### Existing listeners and long-running processes
 

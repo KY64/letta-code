@@ -61,8 +61,10 @@ import { debugLog } from "@/utils/debug";
 import { refreshAndListSecrets } from "@/utils/secrets-store";
 import { isRecord } from "@/utils/type-guards";
 import { serializeClientTools } from "./client-tool-serialization";
+import { normalizeExternalToolResultContent } from "./external-tool-content";
 import { toolFilter } from "./filter";
 import { clampToolReturnContent } from "./impl/tool-return-clamp";
+import { resolveBackendSpecificToolAssets } from "./memory-tool-assets";
 import {
   functionToolForm,
   type JsonSchema,
@@ -80,36 +82,6 @@ import { TOOL_DEFINITIONS, type ToolName } from "./tool-definitions";
 import { TOOL_PERMISSIONS } from "./tool-permissions";
 
 export const TOOL_NAMES = Object.keys(TOOL_DEFINITIONS) as ToolName[];
-
-async function resolveBackendSpecificToolDescription(
-  name: string,
-  description: string,
-): Promise<string> {
-  let isLocalMemfs = false;
-  try {
-    const { getBackend } = await import("@/backend");
-    isLocalMemfs = getBackend().capabilities.localMemfs;
-  } catch {
-    isLocalMemfs = false;
-  }
-  if (!isLocalMemfs) return description;
-
-  if (name === "memory_apply_patch") {
-    return description.replace(
-      "The harness pushes clean committed memory changes after the turn for remote MemFS agents.",
-      "Local backend MemFS has no Letta remote; memory changes are committed locally.",
-    );
-  }
-
-  if (name === "memory") {
-    return description.replace(
-      "The harness pushes clean committed memory changes after the turn for remote MemFS agents.",
-      "Local backend MemFS has no Letta remote; memory changes are committed locally.",
-    );
-  }
-
-  return description;
-}
 
 function resolvedModelForm(
   base: ModelFacingToolForm,
@@ -372,8 +344,8 @@ export const ANTHROPIC_DEFAULT_TOOLS: ToolName[] = [
   "Bash",
   "Monitor",
   "TaskOutput",
-  "EnterWorktree",
-  "ExitWorktree",
+  ...WORKTREE_TOOL_NAMES,
+  "SetWorkingDirectory",
   "Edit",
   "TaskStop",
   // "MultiEdit",
@@ -407,8 +379,8 @@ export const GEMINI_DEFAULT_TOOLS: ToolName[] = [
   "glob_gemini",
   "search_file_content",
   "memory",
-  "EnterWorktree",
-  "ExitWorktree",
+  ...WORKTREE_TOOL_NAMES,
+  "SetWorkingDirectory",
   "replace",
   "write_file_gemini",
   "write_todos",
@@ -421,8 +393,8 @@ export const GEMINI_DEFAULT_TOOLS: ToolName[] = [
 export const OPENAI_PASCAL_TOOLS: ToolName[] = [
   // Additional Letta Code tools
   "AskUserQuestion",
-  "EnterWorktree",
-  "ExitWorktree",
+  ...WORKTREE_TOOL_NAMES,
+  "SetWorkingDirectory",
   "memory_apply_patch",
   "Task",
   "Monitor",
@@ -440,8 +412,8 @@ export const OPENAI_PASCAL_TOOLS: ToolName[] = [
 export const GEMINI_PASCAL_TOOLS: ToolName[] = [
   // Additional Letta Code tools
   "AskUserQuestion",
-  "EnterWorktree",
-  "ExitWorktree",
+  ...WORKTREE_TOOL_NAMES,
+  "SetWorkingDirectory",
   "memory",
   "Skill",
   "Task",
@@ -892,15 +864,9 @@ export async function executeExternalTool(
       tool ? { tool } : undefined,
     );
 
-    // Convert external tool result to ToolExecutionResult format
-    const textContent = result.content
-      .filter((c) => c.type === "text" && c.text)
-      .map((c) => c.text)
-      .join("\n");
-
     return {
       toolReturn: clampToolReturnContent(
-        textContent || JSON.stringify(result.content),
+        normalizeExternalToolResultContent(result.content),
         toolName,
       ),
       status: result.isError ? "error" : "success",
@@ -1260,10 +1226,10 @@ export async function checkToolPermission(
       permissionMode: effectivePermissionModeState?.mode ?? null,
       workingDirectory: effectiveWorkingDirectory,
     });
-
   const permissions = await loadPermissions(effectiveWorkingDirectory);
   return runWithRuntimeContext(
     {
+      ...(context?.runtimeContext ?? {}),
       ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
       workingDirectory: effectiveWorkingDirectory,
       permissionMode: effectivePermissionModeState?.mode,
@@ -1395,15 +1361,17 @@ async function buildSpecificToolRegistry(
       throw new Error(`Tool implementation not found for ${internalName}`);
     }
 
-    const description = await resolveBackendSpecificToolDescription(
+    const resolvedAssets = await resolveBackendSpecificToolAssets(
       internalName,
       definition.description,
+      definition.schema as JsonSchema,
     );
+    const { description, inputSchema } = resolvedAssets;
 
     const toolSchema: ToolSchema = {
       name: internalName,
       description,
-      input_schema: definition.schema as JsonSchema,
+      input_schema: inputSchema,
     };
 
     newRegistry.set(internalName, {
@@ -1411,7 +1379,7 @@ async function buildSpecificToolRegistry(
       modelForm: resolvedModelForm(
         definition.modelForm,
         description,
-        definition.schema as JsonSchema,
+        inputSchema,
       ),
       fn: definition.impl,
     });
@@ -1503,10 +1471,13 @@ async function buildRegistryForModel(
         throw new Error(`Tool implementation not found for ${name}`);
       }
 
-      let description = await resolveBackendSpecificToolDescription(
+      const resolvedAssets = await resolveBackendSpecificToolAssets(
         name,
         definition.description,
+        definition.schema as JsonSchema,
       );
+      let { description } = resolvedAssets;
+      const { inputSchema } = resolvedAssets;
       if (name === "Task" && discoveredSubagents.length > 0) {
         description = injectSubagentsIntoTaskDescription(
           description,
@@ -1517,7 +1488,7 @@ async function buildRegistryForModel(
       const toolSchema: ToolSchema = {
         name,
         description,
-        input_schema: definition.schema as JsonSchema,
+        input_schema: inputSchema,
       };
 
       newRegistry.set(name, {
@@ -1525,7 +1496,7 @@ async function buildRegistryForModel(
         modelForm: resolvedModelForm(
           definition.modelForm,
           description,
-          definition.schema as JsonSchema,
+          inputSchema,
         ),
         fn: definition.impl,
       });
@@ -1765,36 +1736,30 @@ function scrubInvocationSecretRedactions(
 
 function scrubModToolString(
   input: string,
-  agentId: string | undefined,
   redactions: InvocationSecretRedactions,
 ): string {
-  return scrubInvocationSecretRedactions(
-    scrubSecretsFromString(input, agentId),
-    redactions,
-  );
+  return scrubInvocationSecretRedactions(input, redactions);
 }
 
 function scrubModToolReturnContent(
   content: ToolReturnContent,
-  agentId: string | undefined,
   redactions: InvocationSecretRedactions,
 ): ToolReturnContent {
   if (typeof content === "string") {
-    return scrubModToolString(content, agentId, redactions);
+    return scrubModToolString(content, redactions);
   }
   return content.map((block) =>
     block.type === "text"
-      ? { ...block, text: scrubModToolString(block.text, agentId, redactions) }
+      ? { ...block, text: scrubModToolString(block.text, redactions) }
       : block,
   );
 }
 
 function scrubModToolLines(
   lines: string[] | undefined,
-  agentId: string | undefined,
   redactions: InvocationSecretRedactions,
 ): string[] | undefined {
-  return lines?.map((line) => scrubModToolString(line, agentId, redactions));
+  return lines?.map((line) => scrubModToolString(line, redactions));
 }
 
 function createScrubbedError(error: unknown, message: string): Error {
@@ -2208,13 +2173,7 @@ async function executeModTool(
           ? {
               onOutput: (chunk: string, stream: "stdout" | "stderr") => {
                 options.onOutput?.(
-                  stripAnsi(
-                    scrubModToolString(
-                      chunk,
-                      options.scopedAgentId,
-                      redactions,
-                    ),
-                  ),
+                  stripAnsi(scrubModToolString(chunk, redactions)),
                   stream,
                 );
               },
@@ -2245,21 +2204,15 @@ async function executeModTool(
       const recordResult = isRecord(result) ? result : undefined;
       const stdout = scrubModToolLines(
         isStringArray(recordResult?.stdout) ? recordResult.stdout : undefined,
-        options.scopedAgentId,
         redactions,
       );
       const stderr = scrubModToolLines(
         isStringArray(recordResult?.stderr) ? recordResult.stderr : undefined,
-        options.scopedAgentId,
         redactions,
       );
       const toolStatus = getModToolStatus(result);
       const flattenedResponse = clampToolReturnContent(
-        scrubModToolReturnContent(
-          flattenToolResponse(result),
-          options.scopedAgentId,
-          redactions,
-        ),
+        scrubModToolReturnContent(flattenToolResponse(result), redactions),
         toolName,
       );
       const responseSize =
@@ -2325,7 +2278,6 @@ async function executeModTool(
           : error instanceof Error
             ? error.message
             : String(error),
-        options.scopedAgentId,
         redactions,
       );
 
@@ -2612,32 +2564,37 @@ async function executeToolInner(
     try {
       // Inject options for tools that support them without altering schemas
       let enhancedArgs = args;
+      let invocationSecrets: Record<string, string> = {};
+
+      // Every built-in may opt into turn cancellation without adding another
+      // manager-side allowlist entry. The signal remains outside tool schemas.
+      if (options?.signal) {
+        enhancedArgs = { ...enhancedArgs, signal: options.signal };
+      }
 
       if (STREAMING_SHELL_TOOLS.has(internalName)) {
-        if (options?.signal) {
-          enhancedArgs = { ...enhancedArgs, signal: options.signal };
-        }
-        if (options?.onOutput) {
-          enhancedArgs = {
-            ...enhancedArgs,
-            onOutput: (chunk: string, stream: "stdout" | "stderr") => {
-              options.onOutput?.(
-                stripAnsi(scrubSecretsFromString(chunk, scopedAgentId)),
-                stream,
-              );
-            },
-          };
-        }
-        // Keep secret values out of shell interpolation.
+        // Keep secret values out of shell interpolation and only redact values
+        // that this invocation can access.
         const command = enhancedArgs.command ?? enhancedArgs.cmd;
-        const secretEnv =
+        invocationSecrets =
           typeof command === "string" ||
           (Array.isArray(command) &&
             command.every((part) => typeof part === "string"))
             ? extractSecretEnvFromCommand(command, scopedAgentId)
             : {};
-        if (Object.keys(secretEnv).length > 0) {
-          enhancedArgs = { ...enhancedArgs, secretEnv };
+        if (options?.onOutput) {
+          enhancedArgs = {
+            ...enhancedArgs,
+            onOutput: (chunk: string, stream: "stdout" | "stderr") => {
+              options.onOutput?.(
+                stripAnsi(scrubSecretsFromString(chunk, invocationSecrets)),
+                stream,
+              );
+            },
+          };
+        }
+        if (Object.keys(invocationSecrets).length > 0) {
+          enhancedArgs = { ...enhancedArgs, secretEnv: invocationSecrets };
         }
         if (options?.parentScope) {
           enhancedArgs = { ...enhancedArgs, parentScope: options.parentScope };
@@ -2648,9 +2605,6 @@ async function executeToolInner(
       if (internalName === "Task") {
         if (options?.toolCallId) {
           enhancedArgs = { ...enhancedArgs, toolCallId: options.toolCallId };
-        }
-        if (options?.signal) {
-          enhancedArgs = { ...enhancedArgs, signal: options.signal };
         }
         if (options?.parentScope) {
           enhancedArgs = { ...enhancedArgs, parentScope: options.parentScope };
@@ -2675,7 +2629,6 @@ async function executeToolInner(
           ...(options?.toolContextId && {
             _executionContextId: options.toolContextId,
           }),
-          ...(options?.signal && { signal: options.signal }),
         };
       }
 
@@ -2718,7 +2671,7 @@ async function executeToolInner(
       // don't leak into agent context or render as garbage in downstream UIs.
       if (STREAMING_SHELL_TOOLS.has(internalName)) {
         const sanitize = (text: string) =>
-          stripAnsi(scrubSecretsFromString(text, scopedAgentId));
+          stripAnsi(scrubSecretsFromString(text, invocationSecrets));
         if (typeof flattenedResponse === "string") {
           flattenedResponse = sanitize(flattenedResponse);
         } else if (Array.isArray(flattenedResponse)) {

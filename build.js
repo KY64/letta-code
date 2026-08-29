@@ -114,6 +114,10 @@ await Bun.build({
   naming: {
     entry: "image-resize-worker.js",
   },
+  // The Electron-safe build loads a patched native addon and its adjacent
+  // libvips shared library. Keep its package boundary intact so those files
+  // resolve from node_modules at runtime.
+  external: ["@janhapke/sharp-electron"],
 });
 
 // Add shebang to output file
@@ -193,6 +197,11 @@ await Bun.build({
 
 // Browser-safe agent creation presets (personalities, prompts, tags) for
 // surfaces that create Letta Code agents through Core (e.g. the chat web app).
+for (const output of readdirSync(join(__dirname, "dist"))) {
+  if (/^agent-presets-.+\.js(?:\.map)?$/.test(output)) {
+    rmSync(join(__dirname, "dist", output));
+  }
+}
 await Bun.build({
   entrypoints: ["./src/agent-presets.ts"],
   outdir: "./dist",
@@ -200,8 +209,13 @@ await Bun.build({
   format: "esm",
   minify: false,
   sourcemap: "external",
+  splitting: true,
   naming: {
     entry: "agent-presets.js",
+    chunk: "agent-presets-[name].js",
+  },
+  define: {
+    __AGENT_PRESETS_BUNDLE__: "true",
   },
   loader: {
     ".md": "text",
@@ -260,6 +274,18 @@ await Bun.build({
   sourcemap: "external",
   naming: {
     entry: "channels-slack.js",
+  },
+});
+
+await Bun.build({
+  entrypoints: ["./src/channels-telegram.ts"],
+  outdir: "./dist",
+  target: "browser",
+  format: "esm",
+  minify: false,
+  sourcemap: "external",
+  naming: {
+    entry: "channels-telegram.js",
   },
 });
 

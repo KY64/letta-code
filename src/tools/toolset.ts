@@ -1,4 +1,5 @@
 import type { AgentState } from "@letta-ai/letta-client/resources/agents/agents";
+import { getModelProviderType } from "@/agent/available-models";
 import { resolveModel } from "@/agent/model";
 import { resolveModelHandleFromLlmConfig } from "@/agent/model-handles";
 import type { SkillSource } from "@/agent/skill-sources";
@@ -138,9 +139,8 @@ export function deriveToolsetFromModel(
   return isOpenAIModel(resolvedModel) ? "codex" : "default";
 }
 
-type ScopeModelCarrier = Pick<
-  AgentState,
-  "model" | "llm_config" | "model_settings"
+type ScopeModelCarrier = Partial<
+  Pick<AgentState, "model" | "llm_config" | "model_settings">
 >;
 
 function providerTypeFromModelSettings(modelSettings: unknown): string | null {
@@ -187,6 +187,36 @@ function getPreferredAgentModelHandle(
     return agent.model;
   }
   return resolveModelHandleFromLlmConfig(agent.llm_config);
+}
+
+type ModelTarget = {
+  model: string | null;
+  providerType: string | null;
+};
+
+function normalizeModelHandle(model: string | null | undefined): string | null {
+  return model && model.length > 0 ? (resolveModel(model) ?? model) : null;
+}
+
+function modelTargetFromCarrier(
+  carrier: ScopeModelCarrier | null | undefined,
+): ModelTarget {
+  return {
+    model: normalizeModelHandle(getPreferredAgentModelHandle(carrier)),
+    providerType: providerTypeFromModelSettings(carrier?.model_settings),
+  };
+}
+
+function providerForMatchingModel(
+  model: string,
+  targets: ModelTarget[],
+): string | null {
+  for (const target of targets) {
+    if (target.model === model && target.providerType) {
+      return target.providerType;
+    }
+  }
+  return null;
 }
 
 function getToolNamesForToolset(toolsetName: ToolsetName): ToolName[] {
@@ -351,7 +381,7 @@ export async function prepareToolExecutionContextForResolvedTarget(params: {
 export async function prepareToolExecutionContextForScope(params: {
   connectionId?: string;
   environmentDeviceId?: string;
-  agentId: string;
+  agentId: string | null;
   conversationId?: string | null;
   overrideModel?: string | null;
   overrideProviderType?: string | null;
@@ -364,6 +394,7 @@ export async function prepareToolExecutionContextForScope(params: {
   permissionModeState?: PermissionModeState;
   skillsDirectory?: string;
   skillSources?: SkillSource[];
+  workspaceSandbox?: RuntimeContextSnapshot["workspaceSandbox"];
   cachedAgent?: AgentState | null;
   modContext?: ModContext;
   modEvents?: ModEvents;
@@ -385,6 +416,7 @@ export async function prepareToolExecutionContextForScope(params: {
     permissionModeState,
     skillsDirectory,
     skillSources,
+    workspaceSandbox,
     cachedAgent,
     modContext,
     modEvents,
@@ -392,53 +424,64 @@ export async function prepareToolExecutionContextForScope(params: {
   } = params;
 
   const backend = getBackend();
-  const agent = (cachedAgent ??
-    (await backend.retrieveAgent(agentId))) as ScopeModelCarrier;
-  let effectiveModel =
-    overrideModel && overrideModel.length > 0
-      ? (resolveModel(overrideModel) ?? overrideModel)
-      : null;
-  let effectiveProviderType =
-    overrideProviderType !== undefined
-      ? overrideProviderType
-      : providerTypeFromModelSettings(
-          (agent as { model_settings?: unknown }).model_settings,
-        );
+  const agent = agentId
+    ? ((cachedAgent ??
+        (await backend.retrieveAgent(agentId))) as ScopeModelCarrier)
+    : null;
+  const agentTarget = modelTargetFromCarrier(agent);
+  const conversationTarget =
+    conversationId && conversationId !== "default"
+      ? modelTargetFromCarrier(
+          (await backend.retrieveConversation(
+            conversationId,
+          )) as ScopeModelCarrier,
+        )
+      : { model: null, providerType: null };
 
-  if (
-    !effectiveModel &&
-    cachedEffectiveModel &&
-    cachedEffectiveModel.length > 0
-  ) {
-    effectiveModel = resolveModel(cachedEffectiveModel) ?? cachedEffectiveModel;
-  }
-
-  if (!effectiveModel && conversationId && conversationId !== "default") {
-    const conversation = await backend.retrieveConversation(conversationId);
-    const conversationModel = (conversation as { model?: string | null }).model;
-    if (typeof conversationModel === "string" && conversationModel.length > 0) {
-      effectiveModel = resolveModel(conversationModel) ?? conversationModel;
-    }
-    effectiveProviderType =
-      providerTypeFromModelSettings(
-        (conversation as { model_settings?: unknown }).model_settings,
-      ) ?? effectiveProviderType;
-  }
-
-  if (!effectiveModel) {
-    effectiveModel = getPreferredAgentModelHandle(agent);
-  }
+  const explicitModel = normalizeModelHandle(overrideModel);
+  const cachedModel = normalizeModelHandle(cachedEffectiveModel);
+  const effectiveModel =
+    explicitModel ??
+    cachedModel ??
+    conversationTarget.model ??
+    agentTarget.model;
+  let effectiveProviderType = explicitModel
+    ? (overrideProviderType ??
+      providerForMatchingModel(explicitModel, [
+        conversationTarget,
+        agentTarget,
+      ]))
+    : cachedModel
+      ? providerForMatchingModel(cachedModel, [conversationTarget, agentTarget])
+      : conversationTarget.model
+        ? conversationTarget.providerType
+        : agentTarget.providerType;
 
   const toolsetPreference = (() => {
     try {
       return settingsManager.getToolsetPreference(
-        agentId,
+        agentId ?? conversationId ?? "agent-free",
         conversationId ?? "default",
       );
     } catch {
       return "auto" as const;
     }
   })();
+  const effectiveToolsetPreference = clientToolset?.base ?? toolsetPreference;
+
+  if (
+    effectiveModel &&
+    !effectiveProviderType &&
+    effectiveToolsetPreference === "auto"
+  ) {
+    try {
+      effectiveProviderType =
+        (await getModelProviderType(effectiveModel)) ?? null;
+    } catch {
+      // Model metadata is best-effort. Handle-based classification remains
+      // available when the provider inventory cannot be fetched.
+    }
+  }
 
   const scopedConversationId = conversationId ?? "default";
 
@@ -456,19 +499,20 @@ export async function prepareToolExecutionContextForScope(params: {
     modContext,
     modEvents,
     modAdapters,
-    agent: agent as AgentState,
+    agent: agent as AgentState | null,
     runtimeContext: {
       connectionId,
       environmentDeviceId,
       agentId,
-      agentName: (agent as AgentState).name ?? null,
+      agentName: (agent as AgentState | null)?.name ?? null,
       conversationId: scopedConversationId,
       workingDirectory,
       ...(skillsDirectory !== undefined ? { skillsDirectory } : {}),
       ...(skillSources !== undefined ? { skillSources } : {}),
+      ...(workspaceSandbox !== undefined ? { workspaceSandbox } : {}),
     },
   });
-  return { ...result, agent: agent as AgentState };
+  return { ...result, agent: agent as AgentState | null };
 }
 
 /**
