@@ -7,6 +7,8 @@ on:
 
 jobs:
   sync:
+    # Intentionally fork-only: this workflow syncs upstream main into forks,
+    # so it must never run on the upstream repo itself.
     if: github.repository != 'letta-ai/letta-code'
     runs-on: ubuntu-24.04
 
