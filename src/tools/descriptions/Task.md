@@ -18,8 +18,7 @@ When using the Agent tool, you must specify a subagent_type parameter to select 
 - Always include a short description (3-5 words) summarizing what the agent will do
 - Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses
 - When the agent is done, it will return a single message back to you. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result.
-- Agents run in the background by default. The tool result will include a task ID and an output_file path, and you will be notified automatically via a <task-notification> message when it completes — no need to poll. If you need interim progress before then, use the TaskOutput tool with the task ID. You can continue working while background agents run.
-- Set `run_in_background: false` only when you must block and wait for the final report inline.
+- Agents always run in the background. The tool result will include a task ID and an output_file path, and you will be notified automatically via a <task-notification> message when it completes — no need to poll. If you need interim progress before then, use the TaskOutput tool with the task ID. You can continue working while agents run.
 - Agents can be resumed using the `conversation_id` parameter by passing the conversation ID from a previous invocation. When resumed, the agent continues with its full previous context preserved.
 - When the agent is done, it will return a single message back to you along with its conversation ID. You can use this ID to resume the agent later if needed for follow-up work.
 - Provide clear, detailed prompts so the agent can work autonomously and return exactly the information you need.
@@ -45,7 +44,8 @@ When deploying an existing agent, only `general-purpose` is supported: full read
   - Tool access is controlled by subagent_type
 
 - **conversation_id**: Resume from an existing conversation (e.g., "conv-xyz789")
-  - Does NOT require agent_id (conversation IDs are unique and encode the agent)
+  - Normal `conv-...` IDs are globally unique and do not require `agent_id`
+  - If a prior invocation returns the conversation ID `default`, pass both that invocation's `agent_id` and `conversation_id: "default"`; `default` is agent-scoped and cannot identify an agent by itself
   - Continues from the conversation's existing message history
   - Use this to continue context from:
     - A prior Agent tool invocation that returned a conversation_id
@@ -65,6 +65,14 @@ Agent({
 // Continue an existing conversation
 Agent({
   conversation_id: "conv-xyz789",
+  description: "Continue implementation",
+  prompt: "Now implement the fix we discussed"
+})
+
+// Continue an agent's default conversation
+Agent({
+  agent_id: "agent-abc123",
+  conversation_id: "default",
   description: "Continue implementation",
   prompt: "Now implement the fix we discussed"
 })
@@ -121,6 +129,37 @@ Agent({ subagent_type: "fork", description: "Implement component B", prompt: "..
 ```
 
 Note: `fork` cannot be combined with `agent_id` or `conversation_id`.
+
+## Running on Another Computer
+
+Pass `computer` to run the subagent's turn on another connected computer instead of this machine. Works with any subagent type. The call fails fast if the named device is offline, ambiguous, or too old to support routing.
+
+`computer: "cloud"` provisions a Cloud sandbox for the subagent's conversation and runs the turn there. Sandboxes are per-conversation: this is a separate machine from wherever you are running now, even if you are already in a Cloud sandbox.
+
+Omit `computer` to run the subagent on the current machine. That is the default and the right choice for almost all tasks — the subagent shares your working directory and files. Only set `computer` when the task specifically needs another machine (its files, its OS, or an isolated sandbox).
+
+```typescript
+// Fork this conversation and run the work on a connected computer
+Agent({
+  subagent_type: "fork",
+  computer: "office-mac",
+  description: "Run integration tests",
+  prompt: "Run the integration suite in the checkout on this machine and report failures."
+})
+
+// Deploy an existing agent into a fresh Cloud sandbox
+Agent({
+  agent_id: "agent-abc123",
+  computer: "cloud",
+  description: "Build release artifacts",
+  prompt: "Build and upload the release artifacts."
+})
+```
+
+Behavior notes:
+- The remote turn runs with the remote machine's working directory, tools, and skills. Subagent-type tool restrictions (e.g. recall's read-only toolset) travel with the turn on current servers; older servers ignore them.
+- The remote turn's final assistant message is returned as the task result. Token and step statistics are not available for remote runs.
+- The wait tracks turn liveness (new messages, run activity, device online) with an absolute one-hour ceiling rather than a fixed timeout.
 
 ## Concurrency and Safety:
 

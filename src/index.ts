@@ -178,22 +178,20 @@ USAGE
   letta update          Check for updates and install (aliases: upgrade, --update, --upgrade)
   letta memory ...      Memory filesystem subcommands
   letta agents ...      Agents subcommands (JSON-only)
-  letta environments ... List available remote environments (JSON-only)
-  letta teleport ...    Move the current conversation between environments
+  letta computers ...   List available remote computers (JSON-only)
+  letta teleport ...    Move the current conversation between computers
   letta messages ...    Messages subcommands (JSON-only)
+  letta mcp ...         List, search, and call MCP servers available to an agent
   letta mods ...        List and manage local mods
   letta sandbox ...     Transfer files to or from the current Cloud sandbox
-  letta server ...      Run a remote environment, channels, or the App Server
-  letta cloud-mcp ...  Use MCP servers connected to an agent
+  letta server ...      Run a remote computer, channels, or the App Server
   letta connect ...     Connect providers from terminal
   letta backend ...     Show or set the default backend
   letta setup           Re-run first-run setup
   letta install ...     Install a skill or mod package
   letta skills ...      List or delete installed agent skills
-
 OPTIONS
 ${renderCliOptionsHelp()}
-
 SUBCOMMANDS
   letta memory status --agent <id>
   letta memory diff --agent <id>
@@ -205,9 +203,9 @@ SUBCOMMANDS
   letta memory pull --agent <id>
   letta memory tokens [--memory-dir <path>] [--agent <id>] [--format text|json]
   letta agents list [--query <text> | --name <name> | --tags <tags>]
-  letta environments list [--online-only]
-  letta environments current
-  letta teleport list|cloud|local|<environment>
+  letta computers list [--online-only]
+  letta computers current
+  letta teleport list|cloud|local|<computer>
   letta messages search --query <text> [--all-agents]
   letta messages list [--agent <id>]
   letta messages transcript --conversation <id> [--out <path>]
@@ -216,8 +214,8 @@ SUBCOMMANDS
   letta mods enable <package-spec>
   letta mods disable <package-spec>
   letta mods remove <package-spec>
-  letta cloud-mcp list|tools|run ... [--agent <id>]
-  letta server [--env-name <name> | --listen [url]] [options]
+  letta mcp list|get|tools|search|call ... [--agent <id>]
+  letta server [--computer-name <name> | --listen [url]] [options]
   letta connect <provider> [options]
   letta install <thing> [--agent <id> | -n <name>]
   letta skills list [--agent <id> | -n <name>]
@@ -1228,12 +1226,12 @@ async function main(): Promise<void> {
       }
       markMilestone("CREDENTIALS_VALIDATED");
 
-      // Ensure base tools exist on the server (first-run-per-machine,
-      // backgrounded for interactive startup). Must run after credentials are
-      // validated so OAuth tokens are available.
+      // Bootstrap after credential validation. Only interactive startup
+      // backgrounds the request.
       if (isValid) {
         const bootstrapPromise = import("@/agent/bootstrap-tools").then(
-          ({ bootstrapBaseToolsIfNeeded }) => bootstrapBaseToolsIfNeeded(),
+          ({ bootstrapBaseToolsIfNeeded }) =>
+            bootstrapBaseToolsIfNeeded({ quiet: isHeadless }),
         );
         if (isHeadless) {
           await bootstrapPromise;
@@ -2010,7 +2008,7 @@ async function main(): Promise<void> {
           } else {
             try {
               const agent = await backend.retrieveAgent(agentIdArg, {
-                include: ["agent.secrets", "agent.tools", "agent.tags"],
+                include: ["agent.tools", "agent.tags"],
               });
               setValidatedAgent(agent);
               resolvedAgent = agent;
@@ -2036,7 +2034,7 @@ async function main(): Promise<void> {
           } else {
             try {
               const agent = await backend.retrieveAgent(selectedGlobalAgentId, {
-                include: ["agent.secrets", "agent.tools", "agent.tags"],
+                include: ["agent.tools", "agent.tags"],
               });
               setValidatedAgent(agent);
               resolvedAgent = agent;

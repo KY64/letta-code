@@ -17,10 +17,6 @@
       "type": "string",
       "description": "Optional model to use for this agent. If not specified, inherits from parent. Prefer lighter models for quick, straightforward tasks to minimize cost and latency."
     },
-    "run_in_background": {
-      "type": "boolean",
-      "description": "Defaults to true. Set to false only when you must block and wait for the agent's final report inline. Background runs return a task ID/output file and deliver a task notification on completion."
-    },
     "agent_id": {
       "type": "string",
       "description": "Deploy an existing agent instead of creating a new one. Starts a new conversation with that agent."
@@ -28,6 +24,10 @@
     "conversation_id": {
       "type": "string",
       "description": "Resume from an existing conversation. Does NOT require agent_id (conversation IDs are unique and encode the agent)."
+    },
+    "computer": {
+      "type": "string",
+      "description": "Run the subagent on another connected computer instead of this machine. Pass a computer name/connection ID, or \"cloud\" to provision a Cloud sandbox for the subagent's conversation. Fails fast if the device is offline or does not support routing. Omit this field to run on the current machine (the default) — only set it when the task specifically needs to run elsewhere."
     }
   },
   "required": ["description", "prompt", "subagent_type"],

@@ -1,5 +1,5 @@
 /**
- * Git hook scripts installed into memfs memory repos.
+ * Git hook scripts installed into agent and shared memory repositories.
  *
  * The pre-commit hook validates memory markdown frontmatter; the post-commit
  * hook mirrors commits to an optional user-configured memory-repository
@@ -10,8 +10,14 @@
 import { chmodSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { debugLog } from "@/utils/debug";
+import {
+  MEMORY_CONSTRAINTS_CONFIG_PATH,
+  MEMORY_CONSTRAINTS_VALIDATOR_NAME,
+  MEMORY_CONSTRAINTS_VALIDATOR_SCRIPT,
+} from "./memory-constraints";
 
 const MEMORY_LAYOUT_POLICY = "letta-memory-layout-policy";
+type MemoryLayoutPolicy = "legacy-only" | "root-marker" | "shared-memory";
 
 /**
  * Bash pre-commit hook that validates frontmatter in memory .md files.
@@ -25,6 +31,7 @@ const MEMORY_LAYOUT_POLICY = "letta-memory-layout-policy";
  * - Only allowed agent-editable key: description
  * - Legacy key 'limit' is tolerated for backward compatibility
  * - read_only may exist (from server) but agent must not change it
+ * - Optional file-size and depth constraints come from .memfs.config.json
  */
 export const PRE_COMMIT_HOOK_SCRIPT = `#!/usr/bin/env bash
 # Validate frontmatter in staged memory .md files
@@ -37,6 +44,13 @@ errors=""
 
 memory_layout_policy_file="$(git rev-parse --git-common-dir 2>/dev/null)/${MEMORY_LAYOUT_POLICY}"
 memory_layout_policy=$(cat "$memory_layout_policy_file" 2>/dev/null || true)
+
+validate_memory_constraints() {
+  if git cat-file -e ":${MEMORY_CONSTRAINTS_CONFIG_PATH}" 2>/dev/null || \
+     git cat-file -e "HEAD:${MEMORY_CONSTRAINTS_CONFIG_PATH}" 2>/dev/null; then
+    node "$(git rev-parse --git-common-dir)/hooks/${MEMORY_CONSTRAINTS_VALIDATOR_NAME}" || exit $?
+  fi
+}
 
 validate_v2_file() {
   local file="$1" staged first_line closing_line frontmatter line key value
@@ -98,7 +112,17 @@ validate_v2_file() {
   fi
 }
 
-if [ "$memory_layout_policy" = "root-marker" ] && git cat-file -e ":MEMORY.md" 2>/dev/null; then
+use_v2_validation=false
+case "$memory_layout_policy" in
+  shared-memory) use_v2_validation=true ;;
+  root-marker)
+    if git cat-file -e ":MEMORY.md" 2>/dev/null; then
+      use_v2_validation=true
+    fi
+    ;;
+esac
+
+if [ "$use_v2_validation" = "true" ]; then
   for file in $(git diff --cached --name-only --diff-filter=ACMR | grep -E '^skills/[^/]+\\.md$' || true); do
     errors="$errors\\n  $file: invalid skill path (skills must be folders). Use skills/<name>/SKILL.md"
   done
@@ -109,21 +133,23 @@ if [ "$memory_layout_policy" = "root-marker" ] && git cat-file -e ":MEMORY.md" 2
     esac
 
     projected=true
-    case "$file" in
-      */*)
-        dir=\${file%/*}
-        while [ -n "$dir" ]; do
-          if ! git cat-file -e ":$dir/MEMORY.md" 2>/dev/null; then
-            projected=false
-            break
-          fi
-          case "$dir" in
-            */*) dir=\${dir%/*} ;;
-            *) dir="" ;;
-          esac
-        done
-        ;;
-    esac
+    if [ "$memory_layout_policy" = "root-marker" ]; then
+      case "$file" in
+        */*)
+          dir=\${file%/*}
+          while [ -n "$dir" ]; do
+            if ! git cat-file -e ":$dir/MEMORY.md" 2>/dev/null; then
+              projected=false
+              break
+            fi
+            case "$dir" in
+              */*) dir=\${dir%/*} ;;
+              *) dir="" ;;
+            esac
+          done
+          ;;
+      esac
+    fi
     [ "$projected" = "true" ] && validate_v2_file "$file"
   done < <(git ls-files '*.md')
 
@@ -132,6 +158,7 @@ if [ "$memory_layout_policy" = "root-marker" ] && git cat-file -e ":MEMORY.md" 2
     echo -e "$errors"
     exit 1
   fi
+  validate_memory_constraints
   exit 0
 fi
 
@@ -263,14 +290,15 @@ if [ -n "$errors" ]; then
   echo -e "$errors"
   exit 1
 fi
+validate_memory_constraints
 `;
 
 /**
  * Install the pre-commit hook for frontmatter validation.
  */
-export function installPreCommitHook(
+function installPreCommitHookWithPolicy(
   dir: string,
-  allowRootMemoryLayout = false,
+  policy: MemoryLayoutPolicy,
 ): void {
   const hooksDir = join(dir, ".git", "hooks");
   const hookPath = join(hooksDir, "pre-commit");
@@ -282,11 +310,27 @@ export function installPreCommitHook(
   writeFileSync(hookPath, PRE_COMMIT_HOOK_SCRIPT, "utf-8");
   chmodSync(hookPath, 0o755);
   writeFileSync(
-    join(dir, ".git", MEMORY_LAYOUT_POLICY),
-    allowRootMemoryLayout ? "root-marker\n" : "legacy-only\n",
+    join(hooksDir, MEMORY_CONSTRAINTS_VALIDATOR_NAME),
+    MEMORY_CONSTRAINTS_VALIDATOR_SCRIPT,
     "utf8",
   );
+  writeFileSync(join(dir, ".git", MEMORY_LAYOUT_POLICY), `${policy}\n`, "utf8");
   debugLog("memfs-git", "Installed pre-commit hook");
+}
+
+export function installPreCommitHook(
+  dir: string,
+  allowRootMemoryLayout = false,
+): void {
+  installPreCommitHookWithPolicy(
+    dir,
+    allowRootMemoryLayout ? "root-marker" : "legacy-only",
+  );
+}
+
+/** Install memory validation for an attached shared repository. */
+export function installSharedMemoryPreCommitHook(dir: string): void {
+  installPreCommitHookWithPolicy(dir, "shared-memory");
 }
 
 /**
