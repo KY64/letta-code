@@ -49,20 +49,9 @@ If a broken model or prompt prevents the agent from completing a turn, recover o
 
 Local settings, server state, and the current process are different sources of truth. Inspect the layer you intend to change before writing it.
 
-Start with the authenticated, backend-aware active configuration report:
-
-```bash
-letta agents config
-```
-
-With no arguments it uses `AGENT_ID` and `CONVERSATION_ID` from the current session. To inspect an explicit scope:
-
-```bash
-letta agents config --agent "$AGENT_ID"
-letta agents config --conversation "$CONVERSATION_ID"
-```
-
-The conversation form retrieves its parent agent automatically and reports both scopes plus the effective configured model. It works through the active API or local backend; do not read auth files, call REST directly, or decode local persistence paths yourself. A configured router handle such as `letta/auto` does not identify the underlying model selected for one inference.
+- `letta model list [--byok | --hosted]` lists available models.
+- `letta model set [model_handle] [--reasoning <reasoning-option>] [--default]` overrides the current conversation's model or reasoning; `--default` overrides the agent's default instead.
+- `letta model get [--default]` gets the current model configuration; `--default` gets the agent's default configuration.
 
 Use the secret-safe local/runtime report for harness settings, permissions, and backend diagnostics:
 
@@ -278,7 +267,7 @@ Per-agent `agents[]` entries are keyed by `agentId` plus server. For api.letta.c
 
 Base URL resolution is split between runtime API calls and settings lookup. Runtime API calls require `LETTA_BASE_URL` or an explicit script `--base-url`; do not replace it with a hard-coded Cloud URL. Settings server keys resolve from `LETTA_SETTINGS_BASE_URL`, `env.LETTA_SETTINGS_BASE_URL`, `LETTA_BASE_URL`, `env.LETTA_BASE_URL`, then api.letta.com. Do not move `agents[]` entries across base URLs unless the user is deliberately migrating servers.
 
-Toolset values currently include `auto`, `default`, `codex`, `codex_snake`, `gemini`, `gemini_snake`, and `none`. Use `auto` unless the user explicitly wants a manual override.
+Toolset values currently include `auto`, `letta`, `default`, `codex`, `codex_snake`, `gemini`, `gemini_snake`, and `none`. Use `auto` unless the user explicitly wants a manual override.
 
 ## Permissions
 

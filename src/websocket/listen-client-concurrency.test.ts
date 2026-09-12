@@ -1318,7 +1318,7 @@ describe("listen-client multi-worker concurrency", () => {
       | Array<Record<string, unknown>>
       | undefined;
 
-    expect(firstSendMessages).toHaveLength(2);
+    expect(firstSendMessages).toHaveLength(3);
     expect(firstSendMessages?.[0]).toMatchObject({
       type: "approval",
       approvals: [
@@ -1329,7 +1329,7 @@ describe("listen-client multi-worker concurrency", () => {
         },
       ],
     });
-    expect(firstSendMessages?.[1]).toEqual({
+    expect(firstSendMessages?.[2]).toEqual({
       role: "user",
       content: [
         {
@@ -2184,12 +2184,11 @@ describe("listen-client multi-worker concurrency", () => {
     let serverSecrets: Record<string, string> = {};
     __testOverrideSecretsBackend({
       capabilities: { serverSecrets: true },
-      retrieveAgent: async () => ({
-        secrets: Object.entries(serverSecrets).map(([key, value]) => ({
+      listAgentSecrets: async () =>
+        Object.entries(serverSecrets).map(([key, value]) => ({
           key,
           value,
         })),
-      }),
       updateAgent: async (_agentId, body) => {
         serverSecrets = { ...body.secrets };
       },

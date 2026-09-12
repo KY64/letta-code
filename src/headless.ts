@@ -22,6 +22,7 @@ import {
 } from "@/utils/message-queue-bridge";
 import { detectShellContext } from "@/utils/shell-context";
 import { createSigintAbortSignal } from "@/utils/sigint-abort";
+import { consumeSubagentLaunch } from "@/utils/subagent-launch-marker";
 import { reportSubagentStdoutLoss } from "@/utils/subagent-stdout-failure";
 import { isAgentIdCompatibleWithBackend } from "./agent/agent-id";
 import type { ApprovalResult } from "./agent/approval-execution";
@@ -61,7 +62,10 @@ import {
 import { updateAgentLLMConfig, updateAgentSystemPrompt } from "./agent/modify";
 import { buildCreateAgentOptionsForPersonality } from "./agent/personality";
 import { resolvePersonalityId } from "./agent/personality-presets";
-import type { MemoryPromptMode } from "./agent/prompt-assets";
+import {
+  INTERRUPT_RECOVERY_ALERT,
+  type MemoryPromptMode,
+} from "./agent/prompt-assets";
 import { resolveSkillSourcesSelection } from "./agent/skill-sources";
 import type { SkillSource } from "./agent/skills";
 import { SessionStats } from "./agent/stats";
@@ -82,7 +86,6 @@ import {
   normalizeConversationShorthandFlags,
   parseCsvListFlag,
   parsePositiveIntFlag,
-  resolveImportFlagAlias,
 } from "./cli/flag-utils";
 import {
   createBuffers,
@@ -111,13 +114,14 @@ import {
 import { installLocalBackendModEventHooks } from "./cli/mods/local-backend-mod-events";
 import {
   validateConversationDefaultRequiresAgent,
-  validateFlagConflicts,
   validatePrimaryStartupFlagConflicts,
-  validateRegistryHandleOrThrow,
 } from "./cli/startup-flag-validation";
 import { SYSTEM_REMINDER_CLOSE, SYSTEM_REMINDER_OPEN } from "./constants";
+import { tryCloudHeadlessSend } from "./headless-cloud-send";
 import {
   buildEnvironmentCreateMessageBody,
+  getEnvironmentRoutedMessagingUnsupportedReason,
+  isCloudEnvironmentSelector,
   waitForEnvironmentAssistantMessage,
 } from "./headless-environment-response";
 import {
@@ -169,6 +173,7 @@ import {
 import { getCurrentWorkingDirectory } from "./runtime-context";
 import { settingsManager, shouldPersistSessionState } from "./settings-manager";
 import { writeWireMessage, writeWireMessageAsync } from "./stream-json-writer";
+import { stopMonitorsForScope } from "./tools/impl/stop-monitor";
 import {
   INTERACTIVE_USER_INPUT_TOOL_NAMES,
   isInteractiveApprovalTool,
@@ -690,25 +695,6 @@ function formatAgentReplyMetadata(params: {
   });
 }
 
-function isCloudEnvironmentSelector(
-  selector: string | boolean | undefined,
-): boolean {
-  if (typeof selector !== "string") return false;
-  const normalized = selector.trim().toLowerCase();
-  return normalized === "cloud" || normalized === "cloud-sandbox";
-}
-
-function getEnvironmentRoutedMessagingUnsupportedReason(
-  environment: EnvironmentConnection,
-): string | null {
-  if (environment.metadata?.environmentMessageProtocol === "v2-input") {
-    return null;
-  }
-  return `Computer ${environment.connectionName} (${environment.deviceId}) is running Letta Code ${
-    environment.metadata?.lettaCodeVersion ?? "unknown"
-  } and does not advertise computer-routed headless messaging support. Update that runtime or omit --computer to use same-computer messaging.`;
-}
-
 export async function handleHeadlessCommand(
   parsedArgs: ParsedCliArgs,
   model?: string,
@@ -718,6 +704,7 @@ export async function handleHeadlessCommand(
   startupOptions: { requestedBackendMode?: BackendMode } = {},
 ) {
   const { values, positionals } = parsedArgs;
+  const isAgentLaunch = consumeSubagentLaunch(process.env);
   telemetry.setSurface(getTerminalTelemetrySurface(true));
   const modsDisabled = shouldDisableMods({
     cliFlag: values["no-mods"],
@@ -809,6 +796,16 @@ export async function handleHeadlessCommand(
   prepareHeadlessEphemeralBackend(Boolean(values.ephemeral));
   const backend = getBackend();
   markMilestone("HEADLESS_CLIENT_READY");
+  const sendExitCode = await tryCloudHeadlessSend(
+    values,
+    prompt,
+    backend,
+    isAgentLaunch,
+    {
+      writeStdout: writeFinalHeadlessStdout,
+    },
+  );
+  if (sendExitCode !== undefined) return flushAndExit(sendExitCode);
   // Check for --resume flag (interactive only)
   if (values.resume) {
     trackHeadlessBoundaryError(
@@ -843,7 +840,7 @@ export async function handleHeadlessCommand(
   let specifiedAgentId = values.agent;
   const specifiedAgentName = values.name;
   let specifiedConversationId = values.conversation;
-  let specifiedAgentIdFromAmbientBackendSwitch = false;
+  let specifiedAgentIdFromAmbient = false;
   const forceNew = values["new-agent"];
   const ephemeralFlag = values.ephemeral;
   const systemPromptPreset = values.system;
@@ -897,10 +894,6 @@ export async function handleHeadlessCommand(
     process.exit(1);
   }
   const shouldAutoEnableMemfsForNewAgent = !memfsFlag && !isStatelessSession;
-  const fromAfFile = resolveImportFlagAlias({
-    importFlagValue: values.import,
-    fromAfFlagValue: values["from-af"],
-  });
   const preLoadSkillsRaw = values["pre-load-skills"];
   const systemInfoReminderEnabled =
     systemInfoReminderEnabledOverride ?? !values["no-system-info-reminder"];
@@ -984,18 +977,18 @@ export async function handleHeadlessCommand(
     process.env.AGENT_ID ||
     ""
   ).trim();
+  // Infer the calling agent (ambient AGENT_ID) for --backend/--computer routes.
   if (
-    startupOptions.requestedBackendMode &&
+    (startupOptions.requestedBackendMode || usesRemoteEnvironment) &&
     ambientAgentId &&
     !specifiedAgentId &&
     !specifiedAgentName &&
     !specifiedConversationId &&
     !forceNew &&
-    !fromAfFile &&
     !fromAgentId
   ) {
     specifiedAgentId = ambientAgentId;
-    specifiedAgentIdFromAmbientBackendSwitch = true;
+    specifiedAgentIdFromAmbient = true;
   }
 
   // Validate --conv default requires --agent (unless --new-agent will create one)
@@ -1043,7 +1036,6 @@ export async function handleHeadlessCommand(
       specifiedAgentName,
       forceNewAgent: forceNew,
       forceNewConversation,
-      importFile: fromAfFile,
       stateless: statelessFlag,
       ephemeral: ephemeralFlag,
       isHeadless: true,
@@ -1064,52 +1056,6 @@ export async function handleHeadlessCommand(
       "--ephemeral supports direct one-shot headless prompts only",
       "headless_startup_flag_conflicts",
     );
-  }
-
-  // Validate --import flag (also accepts legacy --from-af)
-  // Detect if it's a registry handle (e.g., @author/name) or a local file path
-  let isRegistryImport = false;
-  if (fromAfFile) {
-    try {
-      validateFlagConflicts({
-        guard: fromAfFile,
-        checks: [
-          {
-            when: specifiedAgentId,
-            message: "--import cannot be used with --agent",
-          },
-          {
-            when: specifiedAgentName,
-            message: "--import cannot be used with --name",
-          },
-          {
-            when: forceNew,
-            message: "--import cannot be used with --new-agent",
-          },
-        ],
-      });
-    } catch (error) {
-      return reportAndExitHeadless(
-        "headless_import_flag_validation_failed",
-        error,
-        "headless_startup_import_flag_validation",
-      );
-    }
-
-    // Check if this looks like a registry handle (@author/name)
-    if (fromAfFile.startsWith("@")) {
-      // Definitely a registry handle
-      isRegistryImport = true;
-      // Validate handle format
-      try {
-        validateRegistryHandleOrThrow(fromAfFile);
-      } catch {
-        console.error(
-          `Error: Invalid registry handle "${fromAfFile}". Use format: letta --import @author/agentname`,
-        );
-        process.exit(1);
-      }
-    }
   }
 
   // Validate --name flag
@@ -1181,48 +1127,6 @@ export async function handleHeadlessCommand(
     }
   }
 
-  // Priority 1: Import from AgentFile template (local file or registry)
-  if (!agent && fromAfFile) {
-    let result: { agent: AgentState; skills?: string[] };
-
-    if (isRegistryImport) {
-      // Import from letta-ai/agent-file registry
-      const { importAgentFromRegistry } = await import("@/agent/import");
-      result = await importAgentFromRegistry({
-        handle: fromAfFile,
-        modelOverride: model,
-        stripMessages: true,
-        stripSkills: false,
-      });
-    } else {
-      // Import from local file
-      const { importAgentFromFile } = await import("@/agent/import");
-      result = await importAgentFromFile({
-        filePath: fromAfFile,
-        modelOverride: model,
-        stripMessages: true,
-        stripSkills: false,
-      });
-    }
-
-    agent = result.agent;
-
-    // Mark imported agents as "custom" to prevent legacy auto-migration
-    // from overwriting their system prompt on resume.
-    if (settingsManager.isReady) {
-      settingsManager.setSystemPromptCustom(agent.id);
-    }
-
-    // Display extracted skills summary
-    if (result.skills && result.skills.length > 0) {
-      const { getAgentSkillsDir } = await import("@/agent/skills");
-      const skillsDir = getAgentSkillsDir(agent.id);
-      console.log(
-        `📦 Extracted ${result.skills.length} skill${result.skills.length === 1 ? "" : "s"} to ${skillsDir}: ${result.skills.join(", ")}`,
-      );
-    }
-  }
-
   // Priority 2: Try to use --agent specified ID
   if (!agent && specifiedAgentId) {
     try {
@@ -1230,16 +1134,15 @@ export async function handleHeadlessCommand(
         include: ["agent.tools", "agent.tags"],
       });
     } catch (_error) {
-      if (specifiedAgentIdFromAmbientBackendSwitch) {
-        console.error(
-          `Active agent ${specifiedAgentId} is not available on the ${startupOptions.requestedBackendMode} backend.`,
-        );
+      if (specifiedAgentIdFromAmbient) {
+        const ambientMissMessage = startupOptions.requestedBackendMode
+          ? `Active agent ${specifiedAgentId} is not available on the ${startupOptions.requestedBackendMode} backend.`
+          : `Active agent ${specifiedAgentId} (inferred from the AGENT_ID environment variable) was not found.`;
+        console.error(ambientMissMessage);
         if (startupOptions.requestedBackendMode === "local") {
           console.error(
-            "--backend local uses the local backend store and will not silently switch to a different cwd-local agent.",
-          );
-          console.error(
-            "Use --new-agent to create a local agent, or pass --agent <local-agent-id> to choose one explicitly.",
+            "--backend local uses the local backend store and will not silently switch to a different cwd-local agent.\n" +
+              "Use --new-agent to create a local agent, or pass --agent <local-agent-id> to choose one explicitly.",
           );
         } else {
           console.error(
@@ -1397,8 +1300,7 @@ export async function handleHeadlessCommand(
   markMilestone("HEADLESS_AGENT_RESOLVED");
   const publicAgentId = ephemeralFlag ? null : agent.id;
   telemetry.setCurrentAgent(publicAgentId, agent.tags);
-  const isResumingAgent =
-    !ephemeralFlag && !!(specifiedAgentId || (!forceNew && !fromAfFile));
+  const isResumingAgent = !ephemeralFlag && !!(specifiedAgentId || !forceNew);
   // Refresh presets before applying optional model/system-prompt overrides.
 
   if (isResumingAgent) {
@@ -1475,7 +1377,7 @@ export async function handleHeadlessCommand(
   const secretsAgentId = ephemeralFlag ? undefined : agent?.id;
   const secretsInitPromise = secretsAgentId
     ? import("@/utils/secrets-store").then(({ initSecretsFromServer }) =>
-        initSecretsFromServer(secretsAgentId, agent ?? undefined),
+        initSecretsFromServer(secretsAgentId),
       )
     : Promise.resolve();
 
@@ -2346,6 +2248,11 @@ ${SYSTEM_REMINDER_CLOSE}
 
   // One-shot mode has no input loop, so wire SIGINT directly into the turn.
   const sigintSignal = createSigintAbortSignal();
+  sigintSignal.addEventListener(
+    "abort",
+    () => stopMonitorsForScope({ agentId: agent.id, conversationId }),
+    { once: true },
+  );
   const exitInterrupted = async (): Promise<never> => {
     if (outputFormat === "stream-json") {
       const errorMsg: ErrorMessage = {
@@ -2882,13 +2789,13 @@ ${SYSTEM_REMINDER_CLOSE}
           agentId: agent.id,
           conversationId,
           currentHandle: null,
-          error: runErrorInfo ?? detailFromRun ?? latestErrorText,
+          error: result.errorInfo ?? runErrorInfo ?? latestErrorText,
           exhaustedProviders: chatgptExhaustedProviders,
+          signal: sigintSignal,
         });
         if (rotation) {
           chatgptPlanSwaps += 1;
           const rotationMessage = formatPlanRotationNotice(rotation);
-
           if (outputFormat === "stream-json") {
             const retryMsg: RetryMessage = {
               type: "retry",
@@ -3797,10 +3704,7 @@ async function runBidirectionalMode(
   // Feed lines into queue or resolver
   rl.on("line", (line) => {
     maybeNotifyBlocked(line);
-    // Fast path: handle control_request:interrupt synchronously so we can
-    // abort an in-flight drain without waiting for the main loop to dequeue.
-    // Without this, a runaway thinking turn never sees the interrupt because
-    // `getNextLine()` isn't called until the current drain returns.
+    // Interrupt before dequeue so an in-flight drain can unwind.
     let parsedLine: {
       type?: string;
       request?: { subtype?: string };
@@ -3822,10 +3726,7 @@ async function runBidirectionalMode(
         turnStarting,
       });
       if (action === "abort-active") {
-        // Abort the in-flight turn. Do NOT null the controller here — the
-        // turn's epilogue (line ~4275) reads currentAbortController?.signal.aborted
-        // to classify the result as "interrupted" vs "error". The `finally`
-        // block at the bottom of the user-message branch is what owns nulling.
+        // Preserve the controller until finally so the turn records interruption.
         (currentAbortController as AbortController).abort();
         if (lineResolver) {
           // If the turn is blocked waiting for a permission/external-tool
@@ -3836,10 +3737,7 @@ async function runBidirectionalMode(
           resolve(null);
         }
       } else if (action === "latch") {
-        // Narrow pre-controller race: a user message was just dispatched but
-        // its AbortController isn't created yet. Latch so the imminent turn
-        // aborts. An idle interrupt ("noop") must NOT latch — that would
-        // poison the next user turn.
+        // Latch only for the imminent turn, never for an idle interrupt.
         pendingInterrupt = true;
       }
       const interruptResponse: ControlResponse = {
@@ -4094,11 +3992,7 @@ async function runBidirectionalMode(
         };
         writeWireMessage(initResponse);
       } else if (subtype === "interrupt") {
-        // Abort current operation if any. Do NOT null the controller — the
-        // turn's epilogue (line ~4415) reads currentAbortController?.signal.aborted
-        // to classify the result as "interrupted" vs "error", and the
-        // user-message branch's `finally` is what owns nulling. Mirrors the
-        // fast path in rl.on("line", ...).
+        // Preserve the controller until finally so the turn records interruption.
         if (
           currentAbortController !== null &&
           decideInterruptAction({
@@ -4371,18 +4265,19 @@ async function runBidirectionalMode(
         continue;
       }
 
-      // Create abort controller for this operation.  Drain any latched
-      // interrupt that arrived before the controller existed (race between
-      // the readline 'line' event and the microtask that creates the
-      // controller — see rl.on("line", ...) above).
+      // Drain pre-controller interrupts after installing scoped monitor cleanup.
       currentAbortController = new AbortController();
+      currentAbortController.signal.addEventListener(
+        "abort",
+        () => stopMonitorsForScope({ agentId: agent.id, conversationId }),
+        { once: true },
+      );
       if (pendingInterrupt) {
         pendingInterrupt = false;
         currentAbortController.abort();
       }
       // Controller now exists — close the pre-controller race window.
       turnStarting = false;
-
       turnInProgress = true;
       try {
         const buffers = createBuffers(agent.id);
@@ -4452,14 +4347,14 @@ async function runBidirectionalMode(
         }
         currentInput = turnStartEmission.input;
 
-        // If the previous turn was interrupted mid-tool-call, the agent may be
-        // left in `requires_approval` with a dangling approval. Sending this
-        // fresh turn against that stale state makes the run error (a silent
-        // "refusal" downstream). Clear it first, reusing the same recovery the
-        // resume path uses. Best-effort: a recovery failure must not abort the
-        // new turn. (PR #2631 — handle interrupts.)
+        // Clear dangling approvals before sending fresh input after an interrupt.
         if (priorTurnInterrupted) {
           priorTurnInterrupted = false;
+          currentInput.unshift({
+            role: "user",
+            content: INTERRUPT_RECOVERY_ALERT,
+            otid: randomUUID(),
+          });
           try {
             await resolveAllPendingApprovals();
           } catch (recoveryError) {
@@ -4787,7 +4682,10 @@ async function runBidirectionalMode(
             const executedResults = await executeApprovalBatch(
               decisions,
               undefined,
-              { toolContextId: turnToolContextId ?? undefined },
+              {
+                toolContextId: turnToolContextId ?? undefined,
+                abortSignal: currentAbortController.signal,
+              },
             );
 
             emitLocalToolReturns(executedResults, sessionId);

@@ -129,11 +129,10 @@ function getPrimaryQueueMessageItem(items: QueueItem[]): QueueItem | null {
 
 /**
  * Picks an acting cloud user id to attribute the outbound
- * createMessage to. When a batch coalesces messages from multiple
- * users we use the **last enqueued** sender — matches user intuition
- * ("whoever just hit send pays") and matches the seq order the queue
- * already preserves. Returns undefined when no item in the batch
- * carries an actingUserId (self-hosted / pre-channel-split flow).
+ * createMessage to. Queue consumers keep different non-empty acting users in
+ * separate batches; scanning from the end tolerates unattributed items around
+ * the attributed work. Returns undefined when no item in the batch carries an
+ * actingUserId (self-hosted / pre-channel-split flow).
  */
 export function pickBatchActingUserId(items: QueueItem[]): string | undefined {
   for (let i = items.length - 1; i >= 0; i -= 1) {
@@ -282,11 +281,14 @@ export function shouldProcessInboundMessageDirectly(
   );
 }
 
-export function consumeQueuedTurn(runtime: ConversationRuntime): {
+export function consumeQueuedTurn(
+  runtime: ConversationRuntime,
+  continuation?: { actingUserId: string | undefined },
+): {
   dequeuedBatch: DequeuedBatch;
   queuedTurn: IncomingMessage;
 } | null {
-  const queuedItems = runtime.queueRuntime.peek();
+  const queuedItems = runtime.queueRuntime.peekReady();
   const firstQueuedItem = queuedItems[0];
   if (!firstQueuedItem || !isCoalescable(firstQueuedItem.kind)) {
     return null;
@@ -298,10 +300,17 @@ export function consumeQueuedTurn(runtime: ConversationRuntime): {
   let hasCronPrompt = false;
   let hasModContinue = false;
   let batchConnectionId: string | undefined;
+  let batchActingUserId = firstQueuedItem.actingUserId;
   let batchImageFailureMode: "strict" | "drop" | null = null;
   const isNoCoalesce = (candidate: (typeof queuedItems)[number]): boolean =>
     candidate.kind === "message" && candidate.noCoalesce === true;
   for (const item of queuedItems) {
+    // Tool results belong to the active request's sender. Leave a different
+    // sender's input queued for its own turn, including attributed/anonymous
+    // transitions. Idle queue drains do not have an active sender to preserve.
+    if (continuation && item.actingUserId !== continuation.actingUserId) {
+      break;
+    }
     if (
       !isCoalescable(item.kind) ||
       !hasSameQueueScope(firstQueuedItem, item)
@@ -311,6 +320,13 @@ export function consumeQueuedTurn(runtime: ConversationRuntime): {
     // noCoalesce items run as single-item batches: one never joins an
     // existing batch, and nothing joins a batch it started.
     if (queueLen > 0 && (isNoCoalesce(item) || isNoCoalesce(firstQueuedItem))) {
+      break;
+    }
+    if (
+      batchActingUserId &&
+      item.actingUserId &&
+      batchActingUserId !== item.actingUserId
+    ) {
       break;
     }
 
@@ -338,6 +354,7 @@ export function consumeQueuedTurn(runtime: ConversationRuntime): {
       batchImageFailureMode = itemImageFailureMode;
     }
 
+    batchActingUserId ??= item.actingUserId;
     queueLen += 1;
     if (item.kind === "message") {
       hasMessage = true;
@@ -451,6 +468,15 @@ async function drainQueuedMessages(
       const blockedReason = computeListenerQueueBlockedReason(runtime);
       if (blockedReason) {
         runtime.queueRuntime.tryDequeue(blockedReason);
+        return;
+      }
+
+      if (runtime.queueRuntime.readyLength === 0) {
+        // Only interrupt-parked user messages remain: report it once and wait
+        // for resume_queue or the next inbound message.
+        if (runtime.queueRuntime.length > 0) {
+          runtime.queueRuntime.tryDequeue("paused_by_user");
+        }
         return;
       }
 

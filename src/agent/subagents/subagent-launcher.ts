@@ -6,6 +6,7 @@
 // lower-level backend/runtime/shell helpers and shared subagent types, never
 // back on the subagent manager, so the graph stays acyclic.
 
+import { ACTING_USER_ID_ENV } from "@/agent/acting-user";
 import { type BackendMode, getLocalBackendStorageDir } from "@/backend";
 import { getLocalBackendMemoryFilesystemRoot } from "@/backend/local/paths";
 import {
@@ -17,6 +18,7 @@ import {
   resolveEntryScriptPath,
   resolveLettaInvocation,
 } from "@/tools/impl/shell-env";
+import { SUBAGENT_LAUNCH_ENV } from "@/utils/subagent-launch-marker";
 import type { SubagentLaunchProfile, SubagentMemoryScope } from ".";
 
 interface ResolveSubagentLauncherOptions {
@@ -146,6 +148,8 @@ export interface ComposeSubagentChildEnvOptions {
   inheritedApiKey?: string | null;
   /** Forwarded base URL to avoid per-subagent settings lookups. */
   inheritedBaseUrl?: string | null;
+  /** Authenticated Cloud user responsible for the parent turn. */
+  actingUserId?: string | null;
   /** Optional path to a transcript payload file, exposed to the child as
    * the TRANSCRIPT_PATH env var. Used by reflection subagents so the prompt
    * can reference `$TRANSCRIPT_PATH` (resolved via Bash) instead of
@@ -184,6 +188,7 @@ export function composeSubagentChildEnv(
     memoryScope,
     inheritedApiKey,
     inheritedBaseUrl,
+    actingUserId,
     transcriptPath,
   } = options;
 
@@ -191,7 +196,9 @@ export function composeSubagentChildEnv(
     ...parentProcessEnv,
     ...(inheritedApiKey && { LETTA_API_KEY: inheritedApiKey }),
     ...(inheritedBaseUrl && { LETTA_BASE_URL: inheritedBaseUrl }),
+    ...(actingUserId && { [ACTING_USER_ID_ENV]: actingUserId }),
     LETTA_CODE_AGENT_ROLE: "subagent",
+    [SUBAGENT_LAUNCH_ENV]: "1",
     ...(subagentType === "reflection" && {
       [LETTA_MOD_CAPABILITY_PROFILE_ENV]: PROVIDERS_ONLY_MOD_CAPABILITY_PROFILE,
     }),

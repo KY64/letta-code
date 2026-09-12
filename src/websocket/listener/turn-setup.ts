@@ -9,6 +9,7 @@ import {
   setCurrentAgentId,
   setCurrentAgentName,
 } from "@/agent/context";
+import { INTERRUPT_RECOVERY_ALERT } from "@/agent/prompt-assets";
 import { getBackend } from "@/backend";
 import type { Line } from "@/cli/helpers/accumulator";
 import {
@@ -30,6 +31,7 @@ import {
   ensureListenerModAdaptersForAgent,
 } from "./mod-adapter";
 import type { ConversationPermissionModeState } from "./permission-mode";
+import { hasInterruptedCacheForScope } from "./runtime";
 import { emitListenerTurnStart } from "./turn-events";
 import {
   createTurnInputState,
@@ -117,12 +119,23 @@ export async function prepareListenerTurn(params: {
 
   const messagesToSend: Array<MessageCreate | ApprovalCreate> = [];
   let queuedInterruptedToolCallIds: string[] = [];
+  const wasInterrupted = hasInterruptedCacheForScope(runtime.listener, {
+    agent_id: agentId,
+    conversation_id: conversationId,
+  });
   const consumed = agentId
     ? consumeInterruptQueue(runtime, agentId, conversationId)
     : null;
   if (consumed) {
     messagesToSend.push(consumed.approvalMessage);
     queuedInterruptedToolCallIds = consumed.interruptedToolCallIds;
+  }
+  if (wasInterrupted) {
+    messagesToSend.push({
+      role: "user",
+      content: INTERRUPT_RECOVERY_ALERT,
+      otid: crypto.randomUUID(),
+    });
   }
   messagesToSend.push(...ensureTurnInputMessageOtids(msg.messages));
 
@@ -290,6 +303,7 @@ export async function prepareListenerTurn(params: {
     environmentDeviceId,
     agentId,
     conversationId,
+    actingUserId: msg.actingUserId,
     clientToolset: msg.clientToolset,
     clientToolAllowlist: msg.clientToolAllowlist,
     // Headless clients (SDK sessions, automation) opt out of tools that

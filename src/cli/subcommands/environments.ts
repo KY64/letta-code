@@ -1,4 +1,5 @@
 import { parseArgs } from "node:util";
+import { getRuntimeEnvironmentDeviceId } from "@/backend/api/client";
 import {
   type EnvironmentConnection,
   listEnvironments,
@@ -36,7 +37,9 @@ List options:
 Notes:
   - Output is JSON only.
   - Uses CLI auth; override with LETTA_API_KEY/LETTA_BASE_URL if needed.
-  - Use letta computers current to get this computer's connectionId.
+  - Use letta computers current to get this computer's stable deviceId.
+  - Prefer deviceId or connectionName for --computer and Agent(computer=...).
+    connectionId is ephemeral; use it only to pin a specific listener.
   - Use --computer cloud to route through the target agent's cloud sandbox.
   - Use --computer <name|device-id|connection-id> with headless messaging
     to route a message through a specific registered computer.
@@ -164,7 +167,7 @@ export async function runEnvironmentsSubcommand(
 
   await (deps.initializeSettings ?? (() => settingsManager.initialize()))();
   const list = deps.listEnvironments ?? listEnvironments;
-  const deviceId = settingsManager.getOrCreateDeviceId();
+  const deviceId = getRuntimeEnvironmentDeviceId();
   const savedName = settingsManager.getListenerEnvName();
   const currentVersion = getVersion();
   if (action === "current") {

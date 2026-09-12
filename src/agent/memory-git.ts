@@ -23,7 +23,7 @@ import {
 import { homedir, platform } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 import { promisify } from "node:util";
-import { getClient } from "@/backend/api/client";
+import { getDesktopAccessToken } from "@/auth/desktop-credentials";
 import {
   getMemfsGitProxyRewriteConfig,
   getMemfsServerUrl,
@@ -32,9 +32,11 @@ import { debugLog, debugWarn } from "@/utils/debug";
 import { getUtf16Bom } from "@/utils/text-files";
 import { GIT_MEMORY_ENABLED_TAG } from "./agent-tags";
 import { listAttachedAgentRepositories } from "./attached-repositories";
+import { getAuthToken } from "./memory-auth";
 import { getScopedMemoryFilesystemRoot } from "./memory-filesystem";
 import { withSerializedGitConfigMutation } from "./memory-git-config-lock";
 import {
+  installMemoryGitHooks,
   installPostCommitHook,
   installPreCommitHook,
   installSharedMemoryPreCommitHook,
@@ -470,24 +472,6 @@ function getMemoryRemoteUrl(agentId: string): string {
 }
 
 /**
- * Get a fresh auth token for git operations.
- * Reuses the same token resolution flow as getClient()
- * (env var → settings → OAuth refresh).
- */
-export async function getAuthToken(): Promise<string> {
-  const { getBackend } = await import("@/backend");
-  const backend = getBackend();
-  if (backend.capabilities.localMemfs && !backend.capabilities.remoteMemfs) {
-    return "";
-  }
-
-  const client = await getClient();
-  // The client constructor resolves the token; extract it
-  // biome-ignore lint/suspicious/noExplicitAny: accessing internal client options
-  return (client as any)._options?.apiKey ?? "";
-}
-
-/**
  * Header sent on every git smart-HTTP request so cloud-api can route this
  * agent's repo through hosted MemFS instead of the default memfs-py path.
  *
@@ -548,7 +532,10 @@ export function buildMemfsGitProxyArgs(
 export function shouldConfigurePersistentMemfsCredentialHelper(
   env: NodeJS.ProcessEnv = process.env,
 ): boolean {
-  return getMemfsGitProxyRewriteConfig(env) === null;
+  return (
+    getDesktopAccessToken() === undefined &&
+    getMemfsGitProxyRewriteConfig(env) === null
+  );
 }
 
 export function buildNonInteractiveGitEnv(
@@ -1090,8 +1077,7 @@ async function prepareMemoryRepoForGitOps(
 ): Promise<void> {
   await maybeUpdateMemoryRemoteOrigin(memoryDir, agentId);
   await configureLocalCredentialHelper(memoryDir, token);
-  installPreCommitHook(memoryDir, true);
-  installPostCommitHook(memoryDir);
+  installMemoryGitHooks(memoryDir);
   await ensureLocalMemfsGitConfig(memoryDir, agentId);
 }
 
@@ -1642,8 +1628,7 @@ export async function cloneMemoryRepo(agentId: string): Promise<void> {
   await configureLocalCredentialHelper(dir, token);
 
   // Install commit hooks (pre-commit validates frontmatter; post-commit mirrors)
-  installPreCommitHook(dir, true);
-  installPostCommitHook(dir);
+  installMemoryGitHooks(dir);
 
   // Set canonical local git identity (letta.agentId, user.email, user.name)
   await ensureLocalMemfsGitConfig(dir, agentId);
@@ -1670,8 +1655,7 @@ export async function pullMemory(
 
   // Self-healing: ensure credential helper, hooks, and identity config are current
   await configureLocalCredentialHelper(dir, token);
-  installPreCommitHook(dir, true);
-  installPostCommitHook(dir);
+  installMemoryGitHooks(dir);
   await ensureLocalMemfsGitConfig(dir, agentId);
 
   try {

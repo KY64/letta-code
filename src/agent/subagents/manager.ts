@@ -9,6 +9,7 @@
 
 import { spawn } from "node:child_process";
 import { platform } from "node:os";
+import { resolveActingUserId } from "@/agent/acting-user";
 import { getConversationId, getCurrentAgentId } from "@/agent/context";
 import { getScopedMemoryFilesystemRoot } from "@/agent/memory-filesystem";
 import { detectMemoryFormat } from "@/agent/memory-format";
@@ -370,6 +371,7 @@ async function executeSubagent(
   memoryScope?: SubagentMemoryScope,
   systemPromptOverride?: string,
   environment?: string,
+  actingUserIdOverride?: string,
 ): Promise<SubagentResult> {
   const withModel = (result: SubagentResult): SubagentResult =>
     model ? { ...result, model } : result;
@@ -469,6 +471,7 @@ async function executeSubagent(
       memoryScope,
       inheritedApiKey,
       inheritedBaseUrl,
+      actingUserId: actingUserIdOverride,
       transcriptPath,
     });
 
@@ -596,7 +599,10 @@ async function executeSubagent(
           agentId: parentAgentIdOverride,
         });
         if (primaryModel) {
-          // Retry with the primary agent's model
+          // New agent is required: deploying an existing agent omits --model,
+          // so the retry would keep the unsupported provider. Keep memoryScope
+          // and systemPromptOverride so the replacement child uses the same
+          // writable tree and prompt the first attempt was given.
           return executeSubagent(
             type,
             config,
@@ -605,14 +611,15 @@ async function executeSubagent(
             subagentId,
             true, // Mark as retry to prevent infinite loops
             signal,
-            undefined, // existingAgentId
+            undefined, // existingAgentId: new agent so --model applies
             undefined, // existingConversationId
             maxTurns,
             parentAgentIdOverride,
             transcriptPath,
-            undefined, // memoryScope
-            undefined, // systemPromptOverride
+            memoryScope,
+            systemPromptOverride,
             environment,
+            actingUserIdOverride,
           );
         }
       }
@@ -641,6 +648,7 @@ async function executeSubagent(
           memoryScope,
           systemPromptOverride,
           environment,
+          actingUserIdOverride,
         );
       }
 
@@ -738,6 +746,7 @@ async function executeSubagent(
           memoryScope,
           systemPromptOverride,
           environment,
+          actingUserIdOverride,
         );
       }
     }
@@ -848,7 +857,9 @@ export async function spawnSubagent(
   memoryScope?: SubagentMemoryScope,
   systemPromptOverride?: string,
   environment?: string,
+  actingUserId?: string,
 ): Promise<SubagentResult> {
+  const launchActingUserId = resolveActingUserId(actingUserId);
   const allConfigs = await getAllSubagentConfigs();
   let config = allConfigs[type];
 
@@ -982,6 +993,7 @@ export async function spawnSubagent(
     memoryScope,
     effectiveSystemPromptOverride,
     environment,
+    launchActingUserId,
   );
 
   return result;

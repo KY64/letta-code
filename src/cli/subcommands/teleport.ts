@@ -10,6 +10,7 @@ import {
   teleportToEnvironment,
 } from "@/backend/api/environments";
 import { ApiRequestError } from "@/backend/api/request";
+import { getLocalChannelTeleportError } from "@/channels/teleport-guard";
 import { type SessionRef, settingsManager } from "@/settings-manager";
 
 interface TeleportSubcommandDeps {
@@ -199,6 +200,9 @@ export async function runTeleportSubcommand(
         deps.getLastSession ?? (() => settingsManager.getEffectiveLastSession())
       )(),
     );
+
+    const channelError = getLocalChannelTeleportError(session);
+    if (channelError) throw new Error(channelError);
 
     let targetConnectionId: string;
 

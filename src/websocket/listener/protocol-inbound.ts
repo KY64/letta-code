@@ -76,7 +76,6 @@ import type {
   MemoryHistoryCommand,
   ReadFileCommand,
   ReadMemoryFileCommand,
-  RemoveQueueItemCommand,
   RuntimeScope,
   RuntimeStartCommand,
   SearchBranchesCommand,
@@ -121,6 +120,7 @@ import {
   isGetCwdMapCommand,
   isSetBootWorkingDirectoryCommand,
 } from "./cwd-protocol-inbound";
+import { isResumeQueueCommand } from "./queue-pause-protocol-inbound";
 
 export { isConnectProviderCommand } from "./connect-provider-protocol-inbound";
 
@@ -163,9 +163,9 @@ const TOOLSET_PREFERENCES = new Set([
   "default",
   "gemini",
   "gemini_snake",
+  "letta",
   "none",
 ]);
-
 function isClientToolsetConfig(value: unknown): value is ClientToolsetConfig {
   if (!isObjectRecord(value)) return false;
   return (
@@ -453,9 +453,7 @@ function isChangeDeviceStateCommand(
 }
 
 function isAbortMessageCommand(value: unknown): value is AbortMessageCommand {
-  if (!value || typeof value !== "object") {
-    return false;
-  }
+  if (!value || typeof value !== "object") return false;
   const candidate = value as {
     type?: unknown;
     runtime?: unknown;
@@ -2043,23 +2041,13 @@ export function isExecuteCommandCommand(
     hasValidArgs
   );
 }
-export function isRemoveQueueItemCommand(
-  value: unknown,
-): value is RemoveQueueItemCommand {
-  if (!value || typeof value !== "object") return false;
-  const c = value as {
-    type?: unknown;
-    request_id?: unknown;
-    runtime?: unknown;
-    item_id?: unknown;
-  };
-  return (
-    c.type === "remove_queue_item" &&
-    typeof c.request_id === "string" &&
-    isAgentRuntimeScope(c.runtime) &&
-    typeof c.item_id === "string"
-  );
-}
+
+import {
+  isMonitorStopCommand,
+  isRemoveQueueItemCommand,
+} from "./task-control-protocol-inbound";
+
+export { isRemoveQueueItemCommand } from "./task-control-protocol-inbound";
 
 export function parseServerLifecycleMessage(
   data: WebSocket.RawData,
@@ -2096,6 +2084,7 @@ export function parseServerMessage(
       isInputCommand(parsed) ||
       isChangeDeviceStateCommand(parsed) ||
       isAbortMessageCommand(parsed) ||
+      isResumeQueueCommand(parsed) ||
       isSyncCommand(parsed) ||
       isRuntimeStartCommand(parsed) ||
       isRuntimeExternalToolsUpdateCommand(parsed) ||
@@ -2184,6 +2173,7 @@ export function parseServerMessage(
       isChannelRouteRemoveCommand(parsed) ||
       isExecuteCommandCommand(parsed) ||
       isRemoveQueueItemCommand(parsed) ||
+      isMonitorStopCommand(parsed) ||
       isSearchBranchesCommand(parsed) ||
       isCheckoutBranchCommand(parsed) ||
       isSecretListCommand(parsed) ||
