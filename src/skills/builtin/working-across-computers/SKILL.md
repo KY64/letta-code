@@ -1,9 +1,13 @@
 ---
 name: working-across-computers
-description: Guides work across Cloud, local, and other available computers, including teleporting the current conversation, orchestrating remote subagents, and uploading or downloading files to Cloud sandboxes. Use when moving between computers (e.g. teleporting between cloud/local) or coordinating work and files across them.
+description: Guides work across Cloud, local, and other available computers, including teleporting conversations, running remote subagents, and transferring files. Load when a request needs the user's laptop or another machine's files, apps, or tools; when connecting a computer; or when moving or delegating work between local and Cloud in either direction, including running Cloud subagents from local.
 ---
 
 # Working Across Computers
+
+## Discover access before declaring a limitation
+
+The current filesystem is not the full set of computers you can use. When a request needs another computer, run `letta teleport list`. If a suitable computer is available, delegate there; otherwise follow the [connection instructions](references/connect-a-computer-for-remote-access.md). Do not infer that another computer is inaccessible merely because you are running in Cloud.
 
 ## Choose where to work
 
@@ -21,6 +25,8 @@ description: Guides work across Cloud, local, and other available computers, inc
 Conversation history and agent memory follow the conversation. Files, working directories, installed tools, credentials, and running services belong to each computer; teleporting does not copy the workspace.
 
 For remote subagents, set `computer` and pass source paths and destination conversation IDs explicitly. Use the `Agent` tool definition for invocation and resume options.
+
+If the user wants to connect a new computer, `letta teleport list` has no suitable target, or the requested local machine is missing or unreachable, read [Connect a computer for remote access](references/connect-a-computer-for-remote-access.md).
 
 ## Move this conversation
 

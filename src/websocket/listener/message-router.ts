@@ -69,6 +69,7 @@ import { getActiveRuntime, safeEmitWsEvent } from "./runtime";
 import { parseListenerReadyMessage } from "./split-stream-lifecycle";
 import {
   buildTeleportContinuationMessages,
+  clearExpectedInboundTeleport,
   clearPriorReadyTeleports,
   handleTeleportFailure,
   handleTeleportProbe,
@@ -84,6 +85,7 @@ import type {
   ListenerRuntime,
   ProcessQueuedTurn,
   StartListenerOptions,
+  SyncReplayOptions,
 } from "./types";
 
 type SafeSocketSend = (
@@ -126,7 +128,7 @@ type MessageRouterParams = {
     listenerRuntime: ListenerRuntime,
     socket: WebSocket,
     scope: RuntimeScope,
-    opts?: { recoverApprovals?: boolean; forceDeviceStatus?: boolean },
+    opts?: SyncReplayOptions,
   ) => Promise<void>;
   getOrCreateScopedRuntime: (
     listener: ListenerRuntime,
@@ -384,7 +386,10 @@ export function createListenerMessageHandler(
         try {
           await replaySyncStateForRuntime(runtime, socket, parsed.runtime, {
             recoverApprovals: parsed.recover_approvals !== false,
+            resumeInterruptedTurn: parsed.resume_interrupted_turn === true,
             forceDeviceStatus: parsed.force_device_status === true,
+            onStatusChange: opts.onStatusChange,
+            connectionId: opts.connectionId,
           });
           if (parsed.request_id) {
             safeSocketSend(
@@ -467,6 +472,9 @@ export function createListenerMessageHandler(
             parsed.runtime.agent_id,
             parsed.runtime.conversation_id,
           );
+          // The continuation this scope's runtime_start announced has arrived;
+          // sync recovery may act on its own again from here.
+          clearExpectedInboundTeleport(scopedRuntime);
           const acceptedKey = `teleport:${teleportId}`;
           const previousDisposition =
             scopedRuntime.acceptedInputDispositions.get(acceptedKey);
@@ -475,10 +483,6 @@ export function createListenerMessageHandler(
             return;
           }
           const approvals = parsed.payload.continuation?.approvals;
-          if (!approvals || approvals.length === 0) {
-            acknowledgeInput(true);
-            return;
-          }
           if (scopedRuntime.isProcessing) {
             acknowledgeInput(
               false,

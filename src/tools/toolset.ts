@@ -18,29 +18,29 @@ import { isRecord } from "@/utils/type-guards";
 import { toolFilter } from "./filter";
 import { LETTA_TOOLS } from "./letta-toolset";
 import {
-  ANTHROPIC_DEFAULT_TOOLS,
   clearToolsWithLock,
   filterBuiltInToolNamesByClientAllowlist,
-  GEMINI_DEFAULT_TOOLS,
-  GEMINI_PASCAL_TOOLS,
   getInternalToolName,
   getToolNames,
   isOpenAIModel,
   loadSpecificTools,
   loadTools,
-  OPENAI_DEFAULT_TOOLS,
-  OPENAI_PASCAL_TOOLS,
   type PreparedToolExecutionContext,
   prepareToolExecutionContextForModel,
   prepareToolExecutionContextForSpecificTools,
 } from "./manager";
 import type { PermissionModeState } from "./permission-mode-state";
 import { TOOL_DEFINITIONS, type ToolName } from "./tool-definitions";
+import {
+  ANTHROPIC_DEFAULT_TOOLS,
+  GEMINI_DEFAULT_TOOLS,
+  GEMINI_PASCAL_TOOLS,
+  OPENAI_DEFAULT_TOOLS,
+  OPENAI_PASCAL_TOOLS,
+} from "./toolset-defaults";
 import type { ToolsetName, ToolsetPreference } from "./toolset-types";
 
 export type { ToolsetName, ToolsetPreference } from "./toolset-types";
-
-// Toolset definitions from manager.ts (single source of truth)
 
 const ARTIFACT_TOOL_NAMES: ToolName[] = [
   "read_artifact_file",
@@ -273,7 +273,7 @@ export async function prepareToolExecutionContextForResolvedTarget(params: {
     toolsetPreference,
     clientToolset,
     exclude,
-    clientToolAllowlist,
+    clientToolAllowlist: inputToolAllowlist,
     externalToolScopeIds,
     workingDirectory,
     permissionModeState,
@@ -283,6 +283,18 @@ export async function prepareToolExecutionContextForResolvedTarget(params: {
     runtimeContext,
     agent,
   } = params;
+  const launchTools = runtimeContext?.executionSettings?.tools;
+  const clientToolAllowlist =
+    launchTools === undefined
+      ? inputToolAllowlist
+      : inputToolAllowlist === undefined
+        ? launchTools
+        : launchTools.filter((name) =>
+            inputToolAllowlist.some(
+              (allowed) =>
+                getInternalToolName(allowed) === getInternalToolName(name),
+            ),
+          );
   const effectiveModel =
     modelIdentifier && modelIdentifier.length > 0
       ? (resolveModel(modelIdentifier) ?? modelIdentifier)
@@ -400,6 +412,7 @@ export async function prepareToolExecutionContextForScope(params: {
   skillsDirectory?: string;
   skillSources?: SkillSource[];
   workspaceSandbox?: RuntimeContextSnapshot["workspaceSandbox"];
+  executionSettings?: RuntimeContextSnapshot["executionSettings"];
   cachedAgent?: AgentState | null;
   modContext?: ModContext;
   modEvents?: ModEvents;
@@ -423,6 +436,7 @@ export async function prepareToolExecutionContextForScope(params: {
     skillsDirectory,
     skillSources,
     workspaceSandbox,
+    executionSettings,
     cachedAgent,
     modContext,
     modEvents,
@@ -517,6 +531,7 @@ export async function prepareToolExecutionContextForScope(params: {
       ...(skillsDirectory !== undefined ? { skillsDirectory } : {}),
       ...(skillSources !== undefined ? { skillSources } : {}),
       ...(workspaceSandbox !== undefined ? { workspaceSandbox } : {}),
+      executionSettings,
     },
   });
   return { ...result, agent: agent as AgentState | null };

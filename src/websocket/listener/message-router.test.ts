@@ -117,7 +117,7 @@ describe("listener message router ownership handoff", () => {
         processIncomingMessage: async (incoming, transport, conversation) => {
           expect(incoming.messages).toEqual([
             expect.objectContaining({ type: "approval" }),
-            expect.objectContaining({ role: "system" }),
+            expect.objectContaining({ role: "user" }),
           ]);
           expect(conversation).toBe(runtime);
           transports.push(transport);
@@ -358,8 +358,9 @@ describe("listener message router ownership handoff", () => {
     expect(processedTurns[0]?.messages).toEqual([
       {
         role: "user",
-        content: [{ type: "text", text: "do not drop me" }],
+        content: "do not drop me",
         client_message_id: "cm-input-race",
+        otid: "cm-input-race",
       },
     ]);
     expect(runtime.queuedMessagesByItemId.size).toBe(0);

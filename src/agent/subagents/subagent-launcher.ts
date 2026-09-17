@@ -18,7 +18,12 @@ import {
   resolveEntryScriptPath,
   resolveLettaInvocation,
 } from "@/tools/impl/shell-env";
-import { SUBAGENT_LAUNCH_ENV } from "@/utils/subagent-launch-marker";
+import {
+  LISTENER_CONNECTION_ENV,
+  SUBAGENT_LAUNCH_ENV,
+  SUBAGENT_LAUNCH_PROFILE_ENV,
+  SUBAGENT_NAME_ENV,
+} from "@/utils/subagent-launch-marker";
 import type { SubagentLaunchProfile, SubagentMemoryScope } from ".";
 
 interface ResolveSubagentLauncherOptions {
@@ -126,6 +131,7 @@ export function resolveSubagentLauncher(
 export interface ComposeSubagentChildEnvOptions {
   /** The env of the process spawning the subagent (parent). */
   parentProcessEnv: NodeJS.ProcessEnv;
+  listenerConnectionId?: string | null;
   /** Active backend mode to force in the child CLI process. */
   backendMode?: BackendMode;
   /** Local backend flatfile root to forward when backendMode="local". */
@@ -133,6 +139,7 @@ export interface ComposeSubagentChildEnvOptions {
   /** Parent agent ID. When present, sets LETTA_PARENT_AGENT_ID so prompts,
    * scripts, and the cross-agent guard can identify the immediate parent. */
   parentAgentId: string | undefined;
+  parentConversationId?: string;
   /** Subagent config type, used for type-specific child process isolation. */
   subagentType?: string;
   /** The subagent config's declared launch profile. Subagents with the memory-subagent profile
@@ -155,6 +162,8 @@ export interface ComposeSubagentChildEnvOptions {
    * can reference `$TRANSCRIPT_PATH` (resolved via Bash) instead of
    * interpolating the absolute path. Unset → no TRANSCRIPT_PATH in child. */
   transcriptPath?: string | null;
+  /** Name reserved in the parent process, only for a newly created agent. */
+  subagentName?: string;
 }
 
 /**
@@ -179,6 +188,7 @@ export function composeSubagentChildEnv(
 ): NodeJS.ProcessEnv {
   const {
     parentProcessEnv,
+    listenerConnectionId,
     backendMode,
     localBackendStorageDir,
     parentAgentId,
@@ -199,12 +209,19 @@ export function composeSubagentChildEnv(
     ...(actingUserId && { [ACTING_USER_ID_ENV]: actingUserId }),
     LETTA_CODE_AGENT_ROLE: "subagent",
     [SUBAGENT_LAUNCH_ENV]: "1",
+    [SUBAGENT_LAUNCH_PROFILE_ENV]: launchProfile ?? "default",
     ...(subagentType === "reflection" && {
       [LETTA_MOD_CAPABILITY_PROFILE_ENV]: PROVIDERS_ONLY_MOD_CAPABILITY_PROFILE,
     }),
-    ...(parentAgentId && { LETTA_PARENT_AGENT_ID: parentAgentId }),
+    // Replace inherited parent addresses even when the new scope is unknown.
+    LETTA_PARENT_AGENT_ID: parentAgentId,
+    LETTA_PARENT_CONVERSATION_ID: options.parentConversationId,
     ...(transcriptPath && { TRANSCRIPT_PATH: transcriptPath }),
   };
+
+  // A nested launch must never reuse its parent's assigned creation name.
+  delete childEnv[SUBAGENT_NAME_ENV];
+  if (options.subagentName) childEnv[SUBAGENT_NAME_ENV] = options.subagentName;
 
   if (backendMode === "local") {
     childEnv.LETTA_LOCAL_BACKEND_EXPERIMENTAL = "1";
@@ -219,6 +236,7 @@ export function composeSubagentChildEnv(
   // subagents either have their own memfs (if memfs-enabled) or no MEMORY_DIR
   // at all — their tools will surface resolution errors appropriately.
   if (launchProfile === "memory-subagent") {
+    delete childEnv[LISTENER_CONNECTION_ENV];
     const primaryRoot = memoryScope?.primaryRoot ?? inheritedPrimaryRoot;
     if (primaryRoot) {
       childEnv.MEMORY_DIR = primaryRoot;
@@ -227,9 +245,43 @@ export function composeSubagentChildEnv(
       delete childEnv.MEMORY_DIR;
       delete childEnv.LETTA_MEMORY_DIR;
     }
+  } else if (listenerConnectionId?.startsWith("conn-")) {
+    childEnv[LISTENER_CONNECTION_ENV] = listenerConnectionId;
   }
 
   return childEnv;
+}
+
+export function shouldLaunchThroughListener(options: {
+  launchProfile?: string;
+  cloudBackend: boolean;
+  connectionId?: string;
+  computer?: string;
+  ephemeral?: boolean;
+}): boolean {
+  if (options.ephemeral) {
+    if (options.computer)
+      throw new Error(
+        "Ephemeral conversations cannot be routed to a Cloud computer",
+      );
+    return false;
+  }
+  // Memory workers need whole-process confinement for Edit/Write as well as
+  // Bash. A listener can execute ordinary children, but cannot host that boundary.
+  // They remain one-shot workers, not resumable or addressable listener sessions.
+  if (options.launchProfile === "memory-subagent") {
+    if (options.computer)
+      throw new Error(
+        "Memory subagents must run in their confined local process, not through a computer listener",
+      );
+    return false;
+  }
+  // Select explicit routes before agent lookup; validate backend compatibility
+  // after lookup so an unavailable ambient agent cannot silently be replaced.
+  return (
+    Boolean(options.computer) ||
+    (options.cloudBackend && Boolean(options.connectionId))
+  );
 }
 
 export function resolveSubagentInheritedPrimaryRoot(options: {

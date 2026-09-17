@@ -1,6 +1,12 @@
 import { randomUUID } from "node:crypto";
 import type { Backend } from "@/backend";
 import {
+  buildAgentSendContent,
+  normalizeAgentMessageComputer,
+  resolveAgentMessageDestination,
+  validateAddress,
+} from "@/backend/api/agent-message";
+import {
   type EnqueueReceipt,
   enqueueConversationMessage,
   getLatestConversationSuperRun,
@@ -15,10 +21,7 @@ import {
   EnqueuedWaitError,
   waitForEnqueuedReply,
 } from "./headless-enqueue-wait";
-import {
-  isCloudEnvironmentSelector,
-  resolveEnvironmentMaxWaitMs,
-} from "./headless-environment-response";
+import { resolveEnvironmentMaxWaitMs } from "./headless-environment-response";
 
 type SendValues = ParsedCliArgs["values"];
 type SendBackend = Pick<
@@ -43,43 +46,11 @@ export function shouldEnqueueCloudSend(
   );
 }
 
-export function buildAgentSendReminder(
-  sender: { agentId?: string; conversationId?: string },
-  noWait: boolean,
-): string {
-  if (!sender.agentId) return "";
-  const address = sender.conversationId
-    ? `, conversation ${sender.conversationId}`
-    : "";
-  const instruction = !noWait
-    ? "The sender will only see the final message you generate (not tool calls or reasoning). Include your answer in your final response."
-    : sender.conversationId
-      ? `To reply to agent ${sender.agentId}${address}, use SendAgentMessage if available. Otherwise run letta -p --agent ${sender.agentId} --conversation ${sender.conversationId} --no-wait "your reply". Ordinary assistant output is not forwarded to the sender.`
-      : "Ordinary assistant output is not forwarded to the sender. No return conversation was supplied.";
-  return `<system-reminder>\nThis message is from agent ${sender.agentId}${address}.\n${instruction}\n</system-reminder>\n\n`;
-}
-
-function validateAddress(
-  value: string | undefined,
-  kind: "agent" | "conversation",
-): string | undefined {
-  if (!value) return undefined;
-  if (kind === "conversation" && value === "default") return value;
-  const prefix = kind === "agent" ? "agent" : "conv";
-  if (!new RegExp(`^${prefix}-[a-zA-Z0-9-]+$`).test(value)) {
-    throw new Error(`Invalid ${kind} ID: ${JSON.stringify(value)}`);
-  }
-  return value;
-}
-
 function validateSendOptions(values: SendValues): void {
   if (values.resume)
     throw new Error(
       "--resume is interactive-only; use --conversation <id> in headless mode.",
     );
-  const computer = values.computer ?? values.environment ?? values.env;
-  if (computer !== undefined && !computer.trim())
-    throw new Error("Computer selector must not be empty.");
   if (values["input-format"])
     throw new Error(
       "Cloud message delivery does not support --input-format stream-json.",
@@ -143,9 +114,19 @@ export async function tryCloudHeadlessSend(
       isAgentLaunch,
     )
   ) {
-    if (values["no-wait"])
+    // An Agent process launch aimed at a computer submits through the
+    // listener-launch path, which honors --no-wait by exiting with the
+    // enqueue receipt. Every other non-Cloud destination executes locally
+    // and has nothing to hand back early.
+    const agentLaunchTargetsComputer =
+      isAgentLaunch &&
+      backend.capabilities.environmentRouting &&
+      (values.computer !== undefined ||
+        values.environment !== undefined ||
+        values.env !== undefined);
+    if (values["no-wait"] && !agentLaunchTargetsComputer)
       throw new Error(
-        "--no-wait requires a Cloud message destination; it is not supported for local execution or Agent process launches.",
+        "--no-wait requires a Cloud message destination; it is not supported for local execution or same-computer Agent process launches.",
       );
     return undefined;
   }
@@ -189,6 +170,9 @@ export async function tryCloudHeadlessSend(
     if (!["text", "json", "stream-json"].includes(format))
       throw new Error(`Invalid output format: ${format}`);
     validateSendOptions(values);
+    const computer = normalizeAgentMessageComputer(
+      values.computer ?? values.environment ?? values.env,
+    );
     const explicitSender = values["from-agent"];
     const ambientSender = env.AGENT_ID || env.LETTA_AGENT_ID;
     const sender = {
@@ -228,24 +212,19 @@ export async function tryCloudHeadlessSend(
       throw new Error(
         "Choose a destination with --agent or --conversation. Ambient AGENT_ID identifies the sender.",
       );
-    if (conversationId && conversationId !== "default") {
-      const conversation = await backend.retrieveConversation(conversationId, {
-        signal: controller.signal,
-      });
-      if (agentId && agentId !== conversation.agent_id)
-        throw new Error(
-          "The conversation does not belong to the requested agent.",
-        );
-      agentId = conversation.agent_id ?? undefined;
-    }
-    if (!agentId) throw new Error("--conversation default requires --agent.");
-    if (!conversationId) {
-      const conversation = await backend.createConversation(
-        { agent_id: agentId, ...(sender.agentId ? { hidden: true } : {}) },
-        { signal: controller.signal },
-      );
-      conversationId = conversation.id;
-    }
+    ({ agentId, conversationId } = await resolveAgentMessageDestination(
+      {
+        agentId,
+        conversationId,
+        senderAgentId: sender.agentId,
+        currentConversation: {
+          agentId: ambientSender,
+          conversationId: env.CONVERSATION_ID || env.LETTA_CONVERSATION_ID,
+        },
+      },
+      backend,
+      controller.signal,
+    ));
     const recovery = {
       status_command: `letta messages status --agent ${agentId} --conversation ${conversationId}`,
       messages_command: `letta messages list --agent ${agentId} --conversation ${conversationId}`,
@@ -271,12 +250,8 @@ export async function tryCloudHeadlessSend(
         agentId,
         conversationId,
         clientMessageId,
-        content: `${buildAgentSendReminder(sender, noWait)}${prompt}`,
-        computer: isCloudEnvironmentSelector(
-          values.computer ?? values.environment ?? values.env,
-        )
-          ? "cloud"
-          : (values.computer ?? values.environment ?? values.env),
+        content: buildAgentSendContent(sender, noWait, prompt),
+        computer,
       },
       AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]),
     );

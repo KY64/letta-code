@@ -57,10 +57,15 @@ import {
 } from "@/runtime-context";
 import { settingsManager } from "@/settings-manager";
 import { telemetry } from "@/telemetry";
+import { messageChannelTelemetry } from "@/telemetry/channel";
+import { waitForToolCheckouts } from "@/utils/checkout-readiness";
 import { debugLog } from "@/utils/debug";
 import { refreshAndListSecrets } from "@/utils/secrets-store";
 import { isRecord } from "@/utils/type-guards";
-import { serializeClientTools } from "./client-tool-serialization";
+import {
+  selectModelFacingExternalTools,
+  serializeClientTools,
+} from "./client-tool-serialization";
 import { normalizeExternalToolResultContent } from "./external-tool-content";
 import { toolFilter } from "./filter";
 import { clampToolReturnContent } from "./impl/tool-return-clamp";
@@ -198,10 +203,6 @@ export function filterBuiltInToolNamesByClientAllowlist(
   );
 }
 
-const WORKTREE_TOOL_NAMES = new Set<ToolName>([
-  "EnterWorktree",
-  "ExitWorktree",
-]);
 const ARTIFACT_TOOL_NAMES: ToolName[] = [
   "read_artifact_file",
   "write_artifact_file",
@@ -310,19 +311,6 @@ function filterExternalToolsByScopeIds(
   );
 }
 
-function toModelFacingExternalToolMap(
-  externalTools: Map<string, ExternalToolDefinition>,
-): Map<string, ExternalToolDefinition> {
-  const modelFacingTools = new Map<string, ExternalToolDefinition>();
-  for (const tool of externalTools.values()) {
-    // MVP: if one runtime exposes duplicate model-facing names, the later
-    // registration wins. We keep cross-runtime registrations isolated by using
-    // namespaced internal keys before this final model-facing collapse.
-    modelFacingTools.set(tool.name, tool);
-  }
-  return modelFacingTools;
-}
-
 function filterModToolsByClientAllowlist(
   modTools: Map<string, ModToolDefinition>,
   clientToolAllowlist?: string[],
@@ -339,95 +327,11 @@ function filterModToolsByClientAllowlist(
   );
 }
 
-export const ANTHROPIC_DEFAULT_TOOLS: ToolName[] = [
-  "AskUserQuestion",
-  "Bash",
-  "Monitor",
-  "TaskOutput",
-  ...WORKTREE_TOOL_NAMES,
-  "SetWorkingDirectory",
-  "Edit",
-  "TaskStop",
-  // "MultiEdit",
-  // "LS",
-  "memory",
-  "Read",
-  "Skill",
-  "Task",
-  "TaskCreate",
-  "TaskGet",
-  "TaskList",
-  "TaskUpdate",
-  "Write",
-];
-
-export const OPENAI_DEFAULT_TOOLS: ToolName[] = [
-  "exec_command",
-  "write_stdin",
-  // TODO(codex-parity): add once request_user_input tool exists in raw codex path.
-  // "request_user_input",
-  "apply_patch",
-  "memory_apply_patch",
-  "update_plan",
-  "view_image",
-];
-
-export const GEMINI_DEFAULT_TOOLS: ToolName[] = [
-  "run_shell_command",
-  "read_file_gemini",
-  "list_directory",
-  "glob_gemini",
-  "search_file_content",
-  "memory",
-  ...WORKTREE_TOOL_NAMES,
-  "SetWorkingDirectory",
-  "replace",
-  "write_file_gemini",
-  "write_todos",
-  "read_many_files",
-  "Skill",
-  "Task",
-];
-
-// PascalCase toolsets (codex-2 and gemini-2) for consistency with Skill tool naming
-export const OPENAI_PASCAL_TOOLS: ToolName[] = [
-  // Additional Letta Code tools
-  "AskUserQuestion",
-  ...WORKTREE_TOOL_NAMES,
-  "SetWorkingDirectory",
-  "memory_apply_patch",
-  "Task",
-  "Monitor",
-  "TaskOutput",
-  "TaskStop",
-  "Skill",
-  // Standard Codex tools
-  "exec_command",
-  "write_stdin",
-  "ViewImage",
-  "ApplyPatch",
-  "UpdatePlan",
-];
-
-export const GEMINI_PASCAL_TOOLS: ToolName[] = [
-  // Additional Letta Code tools
-  "AskUserQuestion",
-  ...WORKTREE_TOOL_NAMES,
-  "SetWorkingDirectory",
-  "memory",
-  "Skill",
-  "Task",
-  // Standard Gemini tools
-  "RunShellCommand",
-  "ReadFileGemini",
-  "ListDirectory",
-  "GlobGemini",
-  "SearchFileContent",
-  "Replace",
-  "WriteFileGemini",
-  "WriteTodos",
-  "ReadManyFiles",
-];
+import {
+  ANTHROPIC_DEFAULT_TOOLS,
+  OPENAI_PASCAL_TOOLS,
+  WORKTREE_TOOL_NAMES,
+} from "./toolset-defaults";
 
 type ToolArgs = Record<string, unknown>;
 
@@ -827,7 +731,7 @@ export function getExternalToolDefinition(
  */
 export function getExternalToolsAsClientTools(): ClientTool[] {
   return Array.from(
-    toModelFacingExternalToolMap(
+    selectModelFacingExternalTools(
       filterExternalToolsByRuntimeContext(getExternalToolsRegistry(), {}),
     ).values(),
   ).map((tool) => ({
@@ -837,9 +741,7 @@ export function getExternalToolsAsClientTools(): ClientTool[] {
   }));
 }
 
-/**
- * Execute an external tool via SDK
- */
+/** Execute an external tool via SDK. */
 export async function executeExternalTool(
   toolCallId: string,
   toolName: string,
@@ -855,6 +757,8 @@ export async function executeExternalTool(
     };
   }
 
+  const startedAt = Date.now();
+  let success = false;
   try {
     const tool = toolDefinition ?? getExternalToolDefinition(toolName);
     const result = await executor(
@@ -863,6 +767,7 @@ export async function executeExternalTool(
       input,
       tool ? { tool } : undefined,
     );
+    success = !result.isError;
 
     return {
       toolReturn: clampToolReturnContent(
@@ -877,6 +782,18 @@ export async function executeExternalTool(
       toolReturn: `External tool execution error: ${errorMessage}`,
       status: "error",
     };
+  } finally {
+    if (toolName === "MessageChannel" || toolName === "message_channel") {
+      telemetry.trackToolUsage(
+        toolName,
+        success,
+        Date.now() - startedAt,
+        undefined,
+        success ? undefined : "tool_error",
+        undefined,
+        messageChannelTelemetry(input),
+      );
+    }
   }
 }
 
@@ -888,7 +805,7 @@ export async function executeExternalTool(
 export function getClientToolsFromRegistry(): ClientTool[] {
   return buildClientToolsFromSnapshot(
     toolRegistry,
-    toModelFacingExternalToolMap(
+    selectModelFacingExternalTools(
       filterExternalToolsByRuntimeContext(getExternalToolsRegistry(), {}),
     ),
     getAvailableModToolsRegistry(),
@@ -937,7 +854,7 @@ function capturePreparedToolExecutionContext(
   );
   const executionSnapshot: ToolExecutionContextSnapshot = {
     toolRegistry: toolRegistrySnapshot,
-    externalTools: toModelFacingExternalToolMap(
+    externalTools: selectModelFacingExternalTools(
       filterExternalToolsByClientAllowlist(
         filterExternalToolsByScopeIds(
           filterExternalToolsByRuntimeContext(
@@ -948,6 +865,7 @@ function capturePreparedToolExecutionContext(
         ),
         clientToolAllowlist,
       ),
+      runtimeContext.connectionId,
     ),
     externalExecutor: snapshot.externalExecutor,
     modContext: options?.modContext ?? snapshot.modContext,
@@ -2400,6 +2318,21 @@ async function executeToolInner(
     toolExecutionModContext(executionScope, { workingDirectory });
   const activeModTools =
     context?.modTools ?? getAvailableModToolsRegistry(modContext);
+  try {
+    if (!activeExternalTools.has(name) || activeModTools.has(name))
+      await waitForToolCheckouts(
+        scopedAgentId,
+        name,
+        args,
+        workingDirectory,
+        activeModTools.has(name),
+      );
+  } catch (error) {
+    return {
+      status: "error",
+      toolReturn: `Memory checkout is unavailable: ${String(error)}`,
+    };
+  }
 
   if (activeModTools.has(name)) {
     const modTool = activeModTools.get(name);
@@ -2480,12 +2413,14 @@ async function executeToolInner(
         return createModPermissionToolResult(permissionDecision);
       }
     }
-    return executeExternalTool(
-      options?.toolCallId ?? `ext-${Date.now()}`,
-      name,
-      eventArgs as Record<string, unknown>,
-      externalTool?.executor ?? activeExternalExecutor,
-      externalTool,
+    return runWithRuntimeContext(executionScope, () =>
+      executeExternalTool(
+        options?.toolCallId ?? `ext-${Date.now()}`,
+        name,
+        eventArgs as Record<string, unknown>,
+        externalTool?.executor ?? activeExternalExecutor,
+        externalTool,
+      ),
     );
   }
 

@@ -126,7 +126,13 @@ describe("listener protocol ergonomics", () => {
       runtime,
       expect.anything(),
       { agent_id: "agent-1", conversation_id: "default" },
-      { recoverApprovals: false, forceDeviceStatus: true },
+      {
+        recoverApprovals: false,
+        resumeInterruptedTurn: false,
+        forceDeviceStatus: true,
+        onStatusChange: undefined,
+        connectionId: "conn-test",
+      },
     );
     expect(sent).toContainEqual({
       type: "sync_response",
@@ -252,14 +258,14 @@ describe("listener protocol ergonomics", () => {
       ],
     });
     expect(incoming?.messages[1]).toEqual({
-      role: "system",
+      role: "user",
       content:
         "<system-reminder>Teleportation to this environment is complete. Continue the existing task from this environment now.</system-reminder>",
       otid: "teleport-1:continue",
     });
     expect(
       incoming?.messages.some(
-        (message) => "role" in message && message.role === "user",
+        (message) => "role" in message && message.role === "system",
       ),
     ).toBe(false);
   });
