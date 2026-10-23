@@ -1,5 +1,3 @@
-// src/cli/app/useSubmitHandler.ts
-
 import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -35,6 +33,7 @@ import { buildReflectionMemoryScope } from "@/agent/memory-worktree";
 import { sendMessageStreamWithBackend } from "@/agent/message";
 import { detectPersonalityFromPersonaFile } from "@/agent/personality";
 import type { PersonalityId } from "@/agent/personality-presets";
+import { requestCloudReflectionRun } from "@/agent/reflection-runs";
 import { recordSessionEnd } from "@/agent/session-history";
 import type { SessionStats } from "@/agent/stats";
 import { getBackend } from "@/backend";
@@ -69,11 +68,11 @@ import {
   clearPlaceholdersInText,
 } from "@/cli/helpers/paste-registry";
 import { resolveReasoningTabToggleCommand } from "@/cli/helpers/reasoning-tab-toggle";
+import { parseReflectCommandArgs } from "@/cli/helpers/reflect-command";
 import {
   buildReflectionArenaChoiceQuestions,
   finalizeReflectionArenaChoice,
   formatReflectionArenaAwaitingChoice,
-  launchReflectionArena,
   loadReflectionArenaRun,
   REFLECTION_ARENA_MODEL_A_DEFAULT,
   type ReflectionArenaChoice,
@@ -81,6 +80,7 @@ import {
   sampleReflectionArenaComparisonModel,
   startReflectionArenaRun,
 } from "@/cli/helpers/reflection-arena";
+import { launchReflectionArena } from "@/cli/helpers/reflection-arena-launcher";
 import { finalizeMultiReflectionCompletion } from "@/cli/helpers/reflection-completion";
 import {
   AUTO_REFLECTION_DESCRIPTION,
@@ -99,12 +99,14 @@ import {
   buildReflectionSelectorPrompt,
   readReflectionAutoSelection,
 } from "@/cli/helpers/reflection-transcript";
+import { renameConvo } from "@/cli/helpers/rename-conversation-target";
 import type { ApprovalRequest } from "@/cli/helpers/stream";
 import {
   estimateSystemTokens,
   setSystemPromptDoctorState,
 } from "@/cli/helpers/system-prompt-warning.ts";
 import { getRandomThinkingVerb } from "@/cli/helpers/thinking-messages";
+import { tuiSubmitClientPreferences } from "@/cli/helpers/tui-client-preferences";
 import {
   buildModCommandPrompt,
   parseModCommandArgv,
@@ -148,14 +150,18 @@ import { detectShellContext } from "@/utils/shell-context";
 import { extractTaskNotificationsForDisplay } from "@/utils/task-notifications";
 import { switchCurrentRuntimeWorkingDirectory } from "@/websocket/listener/cwd-change";
 
-import { shouldSlashCommandBypassQueue } from "./command-routing";
+import {
+  aliasBareExitCommand,
+  shouldSlashCommandBypassQueue,
+} from "./command-routing";
 import { buildTextParts } from "./content-parts";
 import { appendOptimisticUserLine, createClientOtid, uid } from "./ids";
-import { saveLastSessionBeforeExit } from "./session";
+import { prepareSessionExit } from "./session";
 import { handleConnectionCommand } from "./submit-connection-commands";
 import { handleDiagnosticsCommand } from "./submit-diagnostics-commands";
 import { handleNavigationCommand } from "./submit-navigation-commands";
 import { handleProfileCommand } from "./submit-profile-commands";
+import { bindTuiClientPreferences, buildTuiTurnInput } from "./turn-input";
 import type {
   ActiveOverlay,
   AppCommandRunner,
@@ -347,12 +353,6 @@ type SubmitHandlerContext = {
   onReload?: () => Promise<void>;
 };
 
-type ReflectCommandArgs =
-  | { instruction?: string; kind: "single" }
-  | { instruction?: string; kind: "recent"; limit: number }
-  | { conversationIds: string[]; instruction?: string; kind: "conversations" }
-  | { instruction?: string; kind: "auto" };
-
 type ReflectArenaCommandArgs =
   | {
       instruction?: string;
@@ -367,19 +367,6 @@ type ReflectArenaCommandArgs =
       runId: string;
     }
   | { kind: "resume"; runId: string };
-
-function isReflectCommandFlag(value: string): boolean {
-  return (
-    value === "--" ||
-    value === "--auto" ||
-    value === "--conversation" ||
-    value === "--instruction" ||
-    value === "--instructions" ||
-    value === "--recent" ||
-    value === "-i" ||
-    value.startsWith("--instruction=")
-  );
-}
 
 function parseReflectArenaCommandArgs(input: string): ReflectArenaCommandArgs {
   const trimmed = input.trim();
@@ -488,114 +475,6 @@ function parseReflectArenaCommandArgs(input: string): ReflectArenaCommandArgs {
   };
 }
 
-function parseReflectCommandArgs(input: string): ReflectCommandArgs {
-  const trimmed = input.trim();
-  const command = trimmed.split(/\s+/, 1)[0] ?? "/reflect";
-  const parts = parseModCommandArgv(trimmed.slice(command.length).trim());
-  if (parts.length === 0) {
-    return { kind: "single" };
-  }
-
-  let recentLimit: number | null = null;
-  const conversationIds: string[] = [];
-  const instructions: string[] = [];
-  let auto = false;
-  for (let index = 0; index < parts.length; index += 1) {
-    const part = parts[index];
-    if (!part) continue;
-    if (
-      part === "--instruction" ||
-      part === "--instructions" ||
-      part === "-i"
-    ) {
-      let instructionEnd = index + 1;
-      while (instructionEnd < parts.length) {
-        const instructionPart = parts[instructionEnd];
-        if (!instructionPart || isReflectCommandFlag(instructionPart)) break;
-        instructionEnd += 1;
-      }
-      const instruction = parts
-        .slice(index + 1, instructionEnd)
-        .join(" ")
-        .trim();
-      if (!instruction) {
-        throw new Error("Usage: /reflect --instruction <instruction>");
-      }
-      instructions.push(instruction);
-      index = instructionEnd - 1;
-      continue;
-    }
-    if (part.startsWith("--instruction=")) {
-      const instruction = part.slice("--instruction=".length).trim();
-      if (!instruction) {
-        throw new Error("Usage: /reflect --instruction <instruction>");
-      }
-      instructions.push(instruction);
-      continue;
-    }
-    if (part === "--") {
-      const instruction = parts
-        .slice(index + 1)
-        .join(" ")
-        .trim();
-      if (!instruction) {
-        throw new Error("Usage: /reflect -- <instruction>");
-      }
-      instructions.push(instruction);
-      break;
-    }
-    if (part === "--auto") {
-      auto = true;
-      continue;
-    }
-    if (part === "--recent") {
-      const raw = parts[index + 1];
-      const parsed = raw ? Number.parseInt(raw, 10) : Number.NaN;
-      if (!Number.isFinite(parsed) || parsed <= 0) {
-        throw new Error("Usage: /reflect --recent <positive integer>");
-      }
-      recentLimit = parsed;
-      index += 1;
-      continue;
-    }
-    if (part === "--conversation") {
-      const conversationId = parts[index + 1];
-      if (!conversationId) {
-        throw new Error("Usage: /reflect --conversation <conversation-id>");
-      }
-      conversationIds.push(conversationId);
-      index += 1;
-      continue;
-    }
-    throw new Error(
-      "Usage: /reflect [--recent N | --conversation <id> ... | --auto] [--instruction <instruction>]",
-    );
-  }
-
-  const instruction = instructions.join("\n").trim() || undefined;
-  const modes = [recentLimit !== null, conversationIds.length > 0, auto].filter(
-    Boolean,
-  ).length;
-  if (modes > 1) {
-    throw new Error("Use only one of --recent, --conversation, or --auto.");
-  }
-  if (auto) {
-    return { instruction, kind: "auto" };
-  }
-  if (recentLimit !== null) {
-    return { instruction, kind: "recent", limit: recentLimit };
-  }
-  if (conversationIds.length > 0) {
-    return { conversationIds, instruction, kind: "conversations" };
-  }
-  return { instruction, kind: "single" };
-}
-
-function aliasBareExitCommand(input: string): string {
-  if (input === "exit" || input === "quit") return "/exit";
-  return input;
-}
-
 export function useSubmitHandler(ctx: SubmitHandlerContext) {
   const {
     abortControllerRef,
@@ -643,7 +522,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
     pendingConversationSwitchRef,
     pendingGitReminderRef,
     processConversation,
-    processConversationWithQueuedApprovals,
     profileConfirmPending,
     projectDirectory,
     queuedApprovalResults,
@@ -706,7 +584,14 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: moved from AppCoordinator; dependencies are preserved from the original callback.
   const onSubmit = useCallback(
-    async (message?: string): Promise<{ submitted: boolean }> => {
+    async (
+      message?: string,
+      submitOptions?: { userInitiated: boolean },
+    ): Promise<{ submitted: boolean }> => {
+      const commandScope = {
+        agentId: agentIdRef.current,
+        conversationId: conversationIdRef.current,
+      };
       const msg = message?.trim() ?? "";
       const overrideContentParts = overrideContentPartsRef.current;
       const hasOverrideContent = overrideContentParts !== null;
@@ -719,6 +604,14 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
       const routedUserText = aliasBareExitCommand(userTextForInput);
       const isSystemOnly =
         taskNotifications.length > 0 && userTextForInput.length === 0;
+      const clientPreferences = tuiSubmitClientPreferences(
+        isSystemOnly,
+        submitOptions,
+      );
+      const processConversationWithQueuedApprovals = bindTuiClientPreferences(
+        ctx.processConversationWithQueuedApprovals,
+        clientPreferences,
+      );
 
       // Handle profile load confirmation (Enter to continue)
       if (profileConfirmPending && !msg && !hasOverrideContent) {
@@ -906,12 +799,12 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
 
           try {
             // Mark command as finished BEFORE sending to agent
-            // (matches /remember pattern - command succeeded in triggering agent)
+            // (command succeeded in triggering agent)
             cmd.finish("Running custom command...", true);
 
             // Send prompt to agent
-            // NOTE: Unlike /remember, we DON'T append args separately because
-            // they're already substituted into the prompt via $ARGUMENTS
+            // NOTE: We DON'T append args separately because they're already
+            // substituted into the prompt via $ARGUMENTS
             await processConversationWithQueuedApprovals([
               {
                 type: "message",
@@ -1704,7 +1597,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
               await revokeToken(currentSettings.refreshToken);
             }
 
-            // Clear all credentials including secrets
+            (await import("@/agent/organization-id")).clearOrganizationId();
             await settingsManager.logout();
 
             // Logged out while already using a local agent → stay in place.
@@ -1723,7 +1616,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
 
             cmd.finish(buildLogoutSuccessMessage(hasEnvApiKey), true);
 
-            saveLastSessionBeforeExit(currentConversationId);
+            await prepareSessionExit(currentConversationId);
 
             // Track session end explicitly (before exit) with stats
             const stats = sessionStatsRef.current.getSnapshot();
@@ -2403,7 +2296,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
             setCommandRunning(true);
 
             try {
-              const backend = getBackend();
               if (shouldAutoGenerate) {
                 const conversationTitle = await generateConversationTitle();
                 if (!conversationTitle) {
@@ -2412,9 +2304,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                   );
                   return { submitted: true };
                 }
-                await backend.updateConversation(conversationId, {
-                  summary: conversationTitle,
-                });
+                await renameConvo(conversationIdRef.current, conversationTitle);
                 setConversationSummary(conversationTitle);
                 setConversationAutoTitleEligibility(false);
                 cmd.finish(
@@ -2422,9 +2312,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                   true,
                 );
               } else {
-                await backend.updateConversation(conversationId, {
-                  summary: newValue,
-                });
+                await renameConvo(conversationIdRef.current, newValue);
                 setConversationSummary(newValue);
                 setConversationAutoTitleEligibility(false);
                 cmd.finish(`Conversation renamed to "${newValue}"`, true);
@@ -2878,70 +2766,6 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
           return { submitted: true };
         }
 
-        // Special handling for /remember command - remember something from conversation
-        if (trimmed.startsWith("/remember")) {
-          // Extract optional description after `/remember`
-          const [, ...rest] = trimmed.split(/\s+/);
-          const userText = rest.join(" ").trim();
-
-          const initialOutput = userText
-            ? "Storing to memory..."
-            : "Processing memory request...";
-
-          const cmd = commandRunner.start(msg, initialOutput);
-
-          // Check for pending approvals before sending (mirrors regular message flow)
-          const approvalCheck = await checkPendingApprovalsForSlashCommand();
-          if (approvalCheck.blocked) {
-            cmd.fail(
-              "Pending approval(s). Resolve approvals before running /remember.",
-            );
-            return { submitted: false }; // Keep /remember in input box, user handles approval first
-          }
-
-          setCommandRunning(true);
-
-          try {
-            // Import the remember prompt
-            const { REMEMBER_PROMPT } = await import(
-              "@/agent/prompt-assets.js"
-            );
-
-            // Build system-reminder content for memory request
-            const rememberReminder = userText
-              ? `${SYSTEM_REMINDER_OPEN}\n${REMEMBER_PROMPT}\n${SYSTEM_REMINDER_CLOSE}`
-              : `${SYSTEM_REMINDER_OPEN}\n${REMEMBER_PROMPT}\n\nThe user did not specify what to remember. Look at the recent conversation context to identify what they likely want you to remember, or ask them to clarify.\n${SYSTEM_REMINDER_CLOSE}`;
-            const rememberParts = userText
-              ? buildTextParts(rememberReminder, userText)
-              : buildTextParts(rememberReminder);
-
-            // Mark command as finished before sending message
-            cmd.finish(
-              userText
-                ? "Storing to memory..."
-                : "Processing memory request from conversation context...",
-              true,
-            );
-
-            // Process conversation with the remember prompt
-            await processConversationWithQueuedApprovals([
-              {
-                type: "message",
-                role: "user",
-                content: rememberParts,
-                otid: randomUUID(),
-              },
-            ]);
-          } catch (error) {
-            const errorDetails = formatErrorDetails(error, agentId);
-            cmd.fail(`Failed: ${errorDetails}`);
-          } finally {
-            setCommandRunning(false);
-          }
-
-          return { submitted: true };
-        }
-
         // Experimental reflection arena - blind A/B reflection model comparison
         if (
           trimmed === "/reflect-arena" ||
@@ -3048,16 +2872,12 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
 
           return { submitted: true };
         }
-        // Special handling for /reflect command - manually launch reflection subagent
-        if (trimmed === "/reflect" || trimmed.startsWith("/reflect ")) {
-          const cmd = commandRunner.start(msg, "Launching reflection agent...");
-
-          if (!isActiveMemfsEnabled(agentId)) {
-            cmd.fail(
-              "Memory filesystem is not enabled. Use /remember instead.",
-            );
-            return { submitted: true };
-          }
+        // All manual aliases resolve ownership before entering any legacy mode.
+        if (/^\/(dream|reflect|reflection)(?:\s|$)/.test(trimmed)) {
+          const agentId = commandScope.agentId;
+          const cmd = commandRunner.start(msg, "Starting reflection...");
+          const reflectionConversationId =
+            commandScope.conversationId ?? "default";
 
           let reflectionReserved = false;
           let reflectionReservationDelegated = false;
@@ -3068,9 +2888,19 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
           };
 
           try {
+            const output = await requestCloudReflectionRun(
+              commandScope,
+              trimmed.replace(/^\/\S+/, "").trim(),
+            );
+            if (output !== null) {
+              cmd.finish(output, true);
+              return { submitted: true };
+            }
+            if (!isActiveMemfsEnabled(commandScope.agentId)) {
+              cmd.fail("Memory filesystem is not enabled.");
+              return { submitted: true };
+            }
             const reflectArgs = parseReflectCommandArgs(trimmed);
-            const reflectionConversationId =
-              conversationIdRef.current ?? "default";
 
             if (reflectArgs.kind === "single") {
               if (experimentManager.isEnabled("reflection_arena")) {
@@ -3112,27 +2942,30 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                 return { submitted: true };
               }
 
-              const result = await launchReflectionSubagent({
-                agentId,
-                conversationId: reflectionConversationId,
-                memfsEnabled: isActiveMemfsEnabled(agentId),
-                triggerSource: "manual",
-                description: AUTO_REFLECTION_DESCRIPTION,
-                instruction: reflectArgs.instruction,
-                completionConversationId: () => conversationIdRef.current,
-                recompileByConversation:
-                  systemPromptRecompileByConversationRef.current,
-                recompileQueuedByConversation:
-                  queuedSystemPromptRecompileByConversationRef.current,
-                onCompletionMessage: (completionMessage) => {
-                  appendTaskNotificationEvents([completionMessage]);
+              const result = await launchReflectionSubagent(
+                {
+                  agentId,
+                  conversationId: reflectionConversationId,
+                  memfsEnabled: isActiveMemfsEnabled(agentId),
+                  triggerSource: "manual",
+                  description: AUTO_REFLECTION_DESCRIPTION,
+                  instruction: reflectArgs.instruction,
+                  completionConversationId: () => conversationIdRef.current,
+                  recompileByConversation:
+                    systemPromptRecompileByConversationRef.current,
+                  recompileQueuedByConversation:
+                    queuedSystemPromptRecompileByConversationRef.current,
+                  onCompletionMessage: (completionMessage) => {
+                    appendTaskNotificationEvents([completionMessage]);
+                  },
+                  feedbackContext: {
+                    parentAgentName: agentName,
+                    parentAgentDescription: agentDescription,
+                    surface: "letta_code_tui",
+                  },
                 },
-                feedbackContext: {
-                  parentAgentName: agentName,
-                  parentAgentDescription: agentDescription,
-                  surface: "letta_code_tui",
-                },
-              });
+                { isCutover: async () => false },
+              ); // Use the captured ownership decision.
 
               if (!result.launched) {
                 const skippedMessage = getReflectionLaunchSkippedMessage(
@@ -3632,7 +3465,7 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
         const registryCmd = isRegistryCommand
           ? commandRunner.start(msg, `Running ${registryCommandName}...`)
           : null;
-        const result = await executeCommand(aliasedMsg);
+        const result = await executeCommand(aliasedMsg, commandScope);
 
         // If command not found, try user-invocable skills before falling through.
         if (result.notFound) {
@@ -3893,38 +3726,23 @@ ${SYSTEM_REMINDER_CLOSE}
 
       // Start the conversation loop. If we have queued approval results from an interrupted
       // client-side execution, send them first before the new user message.
-      const initialInput: Array<MessageCreate | ApprovalCreate> = [];
-
-      if (eagerRecoveryDenials && eagerRecoveryDenials.length > 0) {
-        initialInput.push({
-          type: "approval",
-          approvals: eagerRecoveryDenials,
-          otid: randomUUID(),
-        });
-      }
-
-      const queuedApprovalInput =
-        consumeQueuedApprovalInputForCurrentConversation();
-      if (queuedApprovalInput) {
-        initialInput.push(queuedApprovalInput);
-      }
-
-      initialInput.push({
-        type: "message",
-        role: "user",
+      const initialInput = buildTuiTurnInput({
+        approvals: eagerRecoveryDenials,
+        queuedApproval: consumeQueuedApprovalInputForCurrentConversation(),
         content: messageContent as unknown as MessageCreate["content"],
         otid: userOtid,
       });
 
       await processConversation(initialInput, {
+        clientPreferences,
         submissionGeneration,
         transcriptStartLineIndex,
       });
 
       await runPostTurnMemorySync({
+        conversationId,
         agentId,
         isEnabled: isActiveMemfsEnabled,
-        debugLabel: "Post-turn memory sync",
         enqueueReminder: (text) => {
           enqueueMemoryGitSyncReminder(sharedReminderStateRef.current, {
             text,

@@ -31,6 +31,7 @@ import {
   updateTurnInputMessagesPreservingOtids,
 } from "./turn-input-state";
 import type { TurnFinishTransition, TurnLease } from "./turn-lifecycle";
+import type { finishListenerTurn } from "./turn-terminal";
 import type { ConversationRuntime } from "./types";
 
 type SendOptions = NonNullable<Parameters<typeof sendMessageStream>[2]>;
@@ -45,7 +46,8 @@ export async function startTurnInput(
     permissionModeState: SendOptions["permissionModeState"];
     preparedToolContext: SendOptions["preparedToolContext"];
     overrideModel: SendOptions["overrideModel"];
-    actingUserId?: string;
+    responseFormat?: SendOptions["responseFormat"];
+    actingUserId?: SendOptions["actingUserId"];
     getInput: () => TurnInputState;
     getInterruptedToolCallIds: () => string[];
   },
@@ -69,7 +71,12 @@ export async function startTurnInput(
           }
         : {}),
       ...(params.overrideModel ? { overrideModel: params.overrideModel } : {}),
-      ...(params.actingUserId ? { actingUserId: params.actingUserId } : {}),
+      ...(params.responseFormat
+        ? { responseFormat: params.responseFormat }
+        : {}),
+      ...(params.actingUserId !== undefined
+        ? { actingUserId: params.actingUserId }
+        : {}),
       ...(params.getInterruptedToolCallIds().length > 0
         ? {
             approvalNormalization: {
@@ -156,7 +163,11 @@ export function createTurnInputSender(params: {
   turnLease: TurnLease;
   buildSendOptions: () => Parameters<typeof sendMessageStream>[2];
   onTerminal: (transition: TurnFinishTransition) => void;
+  finalizeTerminal: (
+    options: Parameters<typeof finishListenerTurn>[2],
+  ) => TurnFinishTransition;
   getTurnId: () => string;
+  authorityGuard?: () => boolean;
 }): {
   send: (
     input: Array<MessageCreate | ApprovalCreate>,
@@ -175,6 +186,7 @@ export function createTurnInputSender(params: {
           params.socket,
           params.runtime,
           params.turnLease,
+          { authorityGuard: params.authorityGuard },
         );
       }
       return {
@@ -186,6 +198,7 @@ export function createTurnInputSender(params: {
           params.socket,
           params.runtime,
           params.turnLease,
+          { authorityGuard: params.authorityGuard },
         ),
       };
     },
@@ -197,13 +210,13 @@ export function createTurnInputSender(params: {
         finalizeHandledRecoveryTurn(
           params.runtime,
           params.socket,
-          params.turnLease,
           {
             drainResult: result.drainResult,
             agentId: params.agentId,
             conversationId: params.conversationId,
             turnId: params.getTurnId(),
           },
+          params.finalizeTerminal,
         ),
       );
       return null;

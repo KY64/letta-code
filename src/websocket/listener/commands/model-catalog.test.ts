@@ -25,6 +25,7 @@ describe("listener model catalog", () => {
       label: "Vendor label",
       providerType: "google_ai",
       providerCategory: "byok",
+      supportsStructuredOutputs: true,
     };
     const preset = models.find(
       (model) => model.handle === "google_ai/gemini-3.5-flash",
@@ -41,6 +42,7 @@ describe("listener model catalog", () => {
       handle: byok.handle,
       label: preset?.label,
       updateArgs: { ...preset?.updateArgs, provider_type: "google_ai" },
+      supportsStructuredOutputs: true,
     });
     expect(buildListModelsEntries([], { cloud: true })).toHaveLength(
       models.length,
@@ -177,5 +179,41 @@ describe("listener model catalog", () => {
         description: "",
       },
     ]);
+  });
+
+  test("names the connection when two BYOK rows share a label", () => {
+    const first = {
+      handle: "chatgpt-team/gpt-6.1-sol",
+      label: "gpt-6.1-sol",
+      providerType: "chatgpt_oauth",
+      providerCategory: "byok",
+    };
+    const second = {
+      handle: "chatgpt-personal/gpt-6.1-sol",
+      label: "gpt-6.1-sol",
+      providerType: "chatgpt_oauth",
+      providerCategory: "byok",
+    };
+    const solo = {
+      handle: "chatgpt-team/gpt-6.1-terra",
+      label: "gpt-6.1-terra",
+      providerType: "chatgpt_oauth",
+      providerCategory: "byok",
+    };
+    const entries = buildListModelsEntries([first, second, solo], {
+      cloud: true,
+    });
+    const byHandle = new Map(entries.map((entry) => [entry.handle, entry]));
+    expect(byHandle.get(first.handle)?.label).toBe(
+      "gpt-6.1-sol · chatgpt-team",
+    );
+    expect(byHandle.get(second.handle)?.label).toBe(
+      "gpt-6.1-sol · chatgpt-personal",
+    );
+    expect(byHandle.get(solo.handle)?.label).toBe("gpt-6.1-terra");
+    // Hosted preset rows keep their labels even when variants repeat them.
+    expect(entries.slice(0, models.length).map((entry) => entry.label)).toEqual(
+      models.map((model) => model.label),
+    );
   });
 });

@@ -1,3 +1,4 @@
+import { retireMcpOriginatorTokenOnMixedMerge } from "@/agent/mcp-originator-tokens";
 import {
   type AttributedMessageCreate,
   withMessageAttribution,
@@ -8,11 +9,25 @@ import type {
   QueueItem,
 } from "@/queue/queue-runtime";
 import { isCoalescable } from "@/queue/queue-runtime";
+import { buildTaskNotificationContent } from "@/queue/turn-queue-runtime";
 import { trackBoundaryError } from "@/telemetry/error-reporting";
+import {
+  getStoredClientPreferences,
+  normalizeClientPreferences,
+} from "@/tools/client-preferences";
 import { debugWarn } from "@/utils/debug";
 import { getListenerBlockedReason } from "@/websocket/helpers/listener-queue-adapter";
+import {
+  getOrCreateProcessTransport,
+  getSubscribedListenerConnections,
+} from "./connection";
 import { getInboundImageFailureMode } from "./image-policy";
 import { getInboundClientMessageIds } from "./inbound-queue";
+import {
+  getMcpOriginatorScope,
+  type McpOriginatorScope,
+  sameMcpOriginatorScope,
+} from "./mcp-originator-scope";
 import {
   emitDequeuedUserMessage,
   emitLoopStatusUpdate,
@@ -30,6 +45,7 @@ import { isListenerTransportOpen, type ListenerTransport } from "./transport";
 import type {
   ConversationRuntime,
   IncomingMessage,
+  InputIdentity,
   StartListenerOptions,
 } from "./types";
 
@@ -69,19 +85,67 @@ function hasSameQueueScope(a: QueueItem, b: QueueItem): boolean {
   );
 }
 
+function getBatchActingUserId(items: QueueItem[]): string | null | undefined {
+  // The latest ordinary user message owns a coalesced continuation request.
+  // This deliberately returns undefined for an unattributed latest user so it
+  // clears, rather than inherits, the actor from the turn being continued.
+  const userMessages = items.filter((item) => item.kind === "message");
+  if (userMessages.length > 0) return userMessages.at(-1)?.actingUserId;
+
+  if (items.some((item) => item.actingUserId === null)) return null;
+  const actingUserId = items[0]?.actingUserId;
+  if (
+    !actingUserId ||
+    items.some((item) => item.actingUserId !== actingUserId)
+  ) {
+    return undefined;
+  }
+  return actingUserId;
+}
+
 function buildQueuedTurnMessage(
   runtime: ConversationRuntime,
   batch: DequeuedBatch,
 ): IncomingMessage | null {
   let template: IncomingMessage | undefined;
   const messages: IncomingMessage["messages"] = [];
+  const durableInputIdentities: InputIdentity[] = [];
+  const terminalConsumerIds = new Set<string>();
+  // Every item in the batch must agree on the originator super run for the
+  // merged turn to stay attributed — including cron prompts, task
+  // notifications, and mod continuations, which vote unattributed so
+  // process-owned work can never ride a client message's originator token.
+  // A mixed batch (or one with an unattributed member) runs unattributed
+  // rather than borrowing another run's originator — the same fail-safe as
+  // a mixed acting-user batch.
+  //
+  // The vote is on (super run id, token presence) together, not the id
+  // alone: a token-bearing and a tokenless delivery for the SAME run are
+  // different authority states (the tokenless one is a stale pre-mint frame
+  // whose accept cleared the run's held token). Merging them as "same id"
+  // would let the stale member's work borrow the fresh member's token, so
+  // they vote distinct and the batch runs unattributed.
+  const messageOriginatorIds: Array<string | undefined> = [];
+  const originatorVotes: Array<string | null> = [];
   for (const item of batch.items) {
     const incoming = runtime.queuedMessagesByItemId.get(item.id);
     if (item.kind === "message" && incoming) {
+      messageOriginatorIds.push(incoming.mcpOriginatorSuperRunId);
+      originatorVotes.push(
+        incoming.mcpOriginatorSuperRunId
+          ? `${incoming.mcpOriginatorSuperRunId}${
+              incoming.mcpOriginatorTokenPresent ? "|token" : "|tokenless"
+            }`
+          : null,
+      );
       template ??= {
         ...incoming,
-        actingUserId: incoming.actingUserId ?? item.actingUserId,
+        actingUserId: incoming.actingUserId ?? item.actingUserId ?? undefined,
       };
+      durableInputIdentities.push(...(incoming.durableInputIdentities ?? []));
+      for (const consumerId of incoming.terminalConsumerIds ?? []) {
+        terminalConsumerIds.add(consumerId);
+      }
       messages.push(
         ...incoming.messages.map((message) =>
           "content" in message
@@ -93,16 +157,26 @@ function buildQueuedTurnMessage(
         ),
       );
     } else if (item.kind === "message") {
+      // No stored inbound payload: this message has no originator delivery,
+      // so it votes unattributed in the batch's originator resolution.
+      messageOriginatorIds.push(undefined);
+      originatorVotes.push(null);
       messages.push(
         withMessageAttribution(
           { role: "user", content: item.content },
-          item.actingUserId,
+          item.actingUserId ?? undefined,
         ),
       );
     } else if (isCoalescable(item.kind) && "text" in item) {
+      // Not a client message: no originator delivery, votes unattributed.
+      messageOriginatorIds.push(undefined);
+      originatorVotes.push(null);
       messages.push({
         role: "user",
-        content: item.text,
+        content:
+          item.kind === "task_notification"
+            ? buildTaskNotificationContent(item)
+            : item.text,
         otid: crypto.randomUUID(),
         attribution: {},
       } satisfies AttributedMessageCreate);
@@ -111,11 +185,47 @@ function buildQueuedTurnMessage(
   }
   if (messages.length === 0) return null;
   const scopeItem = batch.items[0];
+  const batchActingUserId = batch.items.some((item) => item.kind === "message")
+    ? getBatchActingUserId(batch.items)
+    : (template?.actingUserId ?? getBatchActingUserId(batch.items));
+  const distinctOriginatorVotes = new Set(originatorVotes);
+  const mcpOriginatorSuperRunId =
+    distinctOriginatorVotes.size === 1
+      ? ([...distinctOriginatorVotes][0]?.split("|")[0] ?? undefined)
+      : undefined;
+  if (distinctOriginatorVotes.size > 1) {
+    // The merged turn is unattributed, so constituent runs' held tokens can
+    // never be legitimately used here — and their inputs are consumed by
+    // this merge, so no later turn will use them either. Retire them now
+    // rather than leaking them until session teardown.
+    for (const id of messageOriginatorIds) {
+      retireMcpOriginatorTokenOnMixedMerge(id);
+    }
+  }
+  // A batch with no client message (cron prompts, task notifications, mod
+  // continuations) has no client waiting on its output, so its turn must not
+  // block on a subscribed delivery owner after tool execution (see #4925).
+  const processOwnedTurn = !batch.items.some((item) => item.kind === "message");
   return {
     type: "message",
     agentId: scopeItem?.agentId ?? runtime.agentId ?? undefined,
     conversationId: scopeItem?.conversationId ?? runtime.conversationId,
     ...template,
+    // Overrides any id the template carried in: only an originator-unanimous
+    // batch keeps one; mixed or unknown batches are explicitly unattributed.
+    mcpOriginatorSuperRunId,
+    ...(processOwnedTurn ? { processOwnedTurn: true } : {}),
+    actingUserId: batchActingUserId ?? undefined,
+    suppressActingUserFallback:
+      batchActingUserId === null ||
+      (batchActingUserId === undefined &&
+        template?.suppressActingUserFallback === true),
+    ...(durableInputIdentities.length > 0
+      ? { durableInputIdentities: [...new Set(durableInputIdentities)] }
+      : {}),
+    ...(terminalConsumerIds.size > 0
+      ? { terminalConsumerIds: [...terminalConsumerIds] }
+      : {}),
     messages,
   };
 }
@@ -184,7 +294,10 @@ export function shouldProcessInboundMessageDirectly(
   );
 }
 
-export function consumeQueuedTurn(runtime: ConversationRuntime): {
+export function consumeQueuedTurn(
+  runtime: ConversationRuntime,
+  activeScope?: McpOriginatorScope,
+): {
   dequeuedBatch: DequeuedBatch;
   queuedTurn: IncomingMessage;
 } | null {
@@ -194,6 +307,18 @@ export function consumeQueuedTurn(runtime: ConversationRuntime): {
     return null;
   }
 
+  const firstScope = getMcpOriginatorScope(
+    firstQueuedItem.kind === "message"
+      ? runtime.queuedMessagesByItemId.get(firstQueuedItem.id)
+      : undefined,
+  );
+  // Omitted means a new turn; null explicitly constrains an unattributed continuation.
+  if (
+    activeScope !== undefined &&
+    !sameMcpOriginatorScope(firstScope, activeScope)
+  )
+    return null;
+
   let queueLen = 0;
   let hasMessage = false;
   let hasTaskNotification = false;
@@ -201,14 +326,38 @@ export function consumeQueuedTurn(runtime: ConversationRuntime): {
   let hasModContinue = false;
   let batchConnectionId: string | undefined;
   let batchImageFailureMode: "strict" | "drop" | null = null;
+  let batchPreferences = JSON.stringify(
+    getStoredClientPreferences(runtime.agentId, runtime.conversationId),
+  );
   const isNoCoalesce = (candidate: (typeof queuedItems)[number]): boolean =>
     candidate.kind === "message" && candidate.noCoalesce === true;
   for (const item of queuedItems) {
     if (
       !isCoalescable(item.kind) ||
-      !hasSameQueueScope(firstQueuedItem, item)
+      !hasSameQueueScope(firstQueuedItem, item) ||
+      !sameMcpOriginatorScope(
+        firstScope,
+        getMcpOriginatorScope(
+          item.kind === "message"
+            ? runtime.queuedMessagesByItemId.get(item.id)
+            : undefined,
+        ),
+      )
     ) {
       break;
+    }
+    const incoming = runtime.queuedMessagesByItemId.get(item.id);
+    if (incoming?.clientPreferences !== undefined) {
+      const preferences = JSON.stringify(
+        normalizeClientPreferences(incoming.clientPreferences),
+      );
+      // A changed selection starts a new turn; identical UI snapshots can steer it.
+      if (
+        preferences !== batchPreferences &&
+        (queueLen > 0 || runtime.turnLifecycle.kind !== "idle")
+      )
+        break;
+      batchPreferences = preferences;
     }
     // noCoalesce items run as single-item batches: one never joins an
     // existing batch, and nothing joins a batch it started.
@@ -281,6 +430,11 @@ export function consumeQueuedTurn(runtime: ConversationRuntime): {
       clientMessageIds,
     );
   }
+  if (queuedTurn.durableInputIdentities?.length) {
+    runtime.dequeuedInputIdentitiesByBatchId.set(dequeuedBatch.batchId, [
+      ...queuedTurn.durableInputIdentities,
+    ]);
+  }
 
   return {
     dequeuedBatch,
@@ -327,6 +481,91 @@ function emitTurnBoundaryStatus(
   emitLoopStatusUpdate(socket, runtime, scope);
 }
 
+function reportQueueStatusCallbackError(error: unknown): void {
+  trackBoundaryError({
+    errorType: "listener_status_callback_failed",
+    error,
+    context: "listener_queue_pump",
+  });
+  debugWarn("Listen", "Error in listener status callback:", error);
+}
+
+function emitQueueListenerStatus(
+  runtime: ConversationRuntime,
+  opts: StartListenerOptions,
+): void {
+  try {
+    emitListenerStatus(
+      runtime.listener,
+      opts.onStatusChange,
+      opts.connectionId,
+    );
+  } catch (error) {
+    reportQueueStatusCallbackError(error);
+  }
+}
+
+function emitQueuePumpBoundary(operation: () => void): void {
+  try {
+    operation();
+  } catch (error) {
+    // Queue ownership has already transferred. Outbound projection failures must
+    // not strand committed work, and restoring after a partial send could replay
+    // user-visible side effects.
+    trackBoundaryError({
+      errorType: "listener_queue_boundary_failed",
+      error,
+      context: "listener_queue_pump",
+    });
+    debugWarn("Listen", "Error emitting listener queue boundary:", error);
+  }
+}
+
+function resolveQueuePumpTransport(
+  runtime: ConversationRuntime,
+  socket: ListenerTransport,
+): ListenerTransport | null {
+  // A scheduled pump may outlive the socket that accepted its input. Route
+  // through the process transport once connections are tracked so a reconnect
+  // can replace the writer without replacing the queue's single pump.
+  if (
+    runtime.listener.connections.size > 0 ||
+    runtime.listener.processTransport !== null
+  ) {
+    const transport = getOrCreateProcessTransport(runtime.listener);
+    if (!isListenerTransportOpen(transport)) return null;
+    // ProcessRuntimeTransport.isOpen() only means *some* connection is open.
+    // Queued input for this scope must have a live recipient before dequeue;
+    // otherwise its user echo and status are silently dropped. Local channel
+    // listeners intentionally execute without a remote subscriber.
+    const localConnection = [...runtime.listener.connections.values()].some(
+      (connection) =>
+        connection.initialized &&
+        "kind" in connection.writer &&
+        connection.writer.kind === "local" &&
+        isListenerTransportOpen(connection.writer),
+    );
+    // Only client-sent input waits for a subscriber. Process-originated work
+    // (cron, task notifications) has no client waiting to receive its echo.
+    const hasClientInput = runtime.queueRuntime
+      .peekReady()
+      .some((item) => item.source === "user");
+    if (
+      !localConnection &&
+      hasClientInput &&
+      getSubscribedListenerConnections(runtime.listener, {
+        agent_id: runtime.agentId,
+        conversation_id: runtime.conversationId,
+      }).length === 0
+    ) {
+      return null;
+    }
+    return transport;
+  }
+  // Untracked test/legacy transports have no process connection to follow.
+  return isListenerTransportOpen(socket) ? socket : null;
+}
+
 async function drainQueuedMessages(
   runtime: ConversationRuntime,
   socket: ListenerTransport,
@@ -350,6 +589,11 @@ async function drainQueuedMessages(
         return;
       }
 
+      // Do not consume a batch without a live delivery path. On reconnect,
+      // the next iteration picks up the replacement writer automatically.
+      const turnTransport = resolveQueuePumpTransport(runtime, socket);
+      if (!turnTransport) return;
+
       const blockedReason = computeListenerQueueBlockedReason(runtime);
       if (blockedReason) {
         runtime.queueRuntime.tryDequeue(blockedReason);
@@ -371,9 +615,18 @@ async function drainQueuedMessages(
       }
 
       const { dequeuedBatch, queuedTurn } = consumedQueuedTurn;
-      emitDequeuedUserMessage(socket, runtime, queuedTurn, dequeuedBatch);
+      emitQueuePumpBoundary(() =>
+        emitDequeuedUserMessage(
+          turnTransport,
+          runtime,
+          queuedTurn,
+          dequeuedBatch,
+        ),
+      );
       // Turn start boundary: unconditional snapshot even when nothing changed.
-      emitTurnBoundaryStatus(runtime, socket);
+      emitQueuePumpBoundary(() =>
+        emitTurnBoundaryStatus(runtime, turnTransport),
+      );
 
       const preTurnStatus =
         getListenerStatus(runtime.listener) === "processing"
@@ -384,17 +637,24 @@ async function drainQueuedMessages(
         runtime.listener.lastEmittedStatus !== preTurnStatus
       ) {
         runtime.listener.lastEmittedStatus = preTurnStatus;
-        opts.onStatusChange?.(preTurnStatus, opts.connectionId);
+        try {
+          opts.onStatusChange?.(preTurnStatus, opts.connectionId);
+        } catch (error) {
+          // The item is already dequeued and its stable ID is committed. A host
+          // callback must not strand accepted work that a retry will deduplicate.
+          reportQueueStatusCallbackError(error);
+        }
       }
       await processQueuedTurn(queuedTurn, dequeuedBatch);
-      emitListenerStatus(
-        runtime.listener,
-        opts.onStatusChange,
-        opts.connectionId,
-      );
+      emitQueueListenerStatus(runtime, opts);
       // Turn end boundary: repair any queue/loop frame the turn's own
       // change-driven emissions failed to deliver.
-      emitTurnBoundaryStatus(runtime, socket);
+      const endTransport = resolveQueuePumpTransport(runtime, socket);
+      if (endTransport) {
+        emitQueuePumpBoundary(() =>
+          emitTurnBoundaryStatus(runtime, endTransport),
+        );
+      }
       evictConversationRuntimeIfIdle(runtime);
     }
   } finally {
@@ -421,8 +681,7 @@ export function scheduleQueuePump(
       runtime.queuePumpScheduled = false;
       if (
         runtime.listener !== getActiveRuntime() ||
-        runtime.listener.intentionallyClosed ||
-        !isListenerTransportOpen(socket)
+        runtime.listener.intentionallyClosed
       ) {
         return;
       }
@@ -436,11 +695,7 @@ export function scheduleQueuePump(
         context: "listener_queue_pump",
       });
       debugWarn("Listen", "Error in queue pump:", error);
-      emitListenerStatus(
-        runtime.listener,
-        opts.onStatusChange,
-        opts.connectionId,
-      );
+      emitQueueListenerStatus(runtime, opts);
       evictConversationRuntimeIfIdle(runtime);
     });
 }

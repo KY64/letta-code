@@ -1,6 +1,5 @@
 import { spawn } from "node:child_process";
 import type WebSocket from "ws";
-import { actingUserRequestOptions } from "@/agent/acting-user";
 import { regenerateConversationDescription } from "@/agent/conversation-description";
 import {
   applySetMaxContext,
@@ -8,7 +7,7 @@ import {
 } from "@/agent/max-context";
 import { getScopedMemoryFilesystemRoot } from "@/agent/memory-filesystem";
 import { getActiveMemoryDirectory } from "@/agent/memory-runtime";
-import { REMEMBER_PROMPT } from "@/agent/prompt-assets";
+import { requestCloudReflectionRun } from "@/agent/reflection-runs";
 import type { ConversationMessageCompactBody } from "@/backend";
 import { getBackend } from "@/backend";
 import { refreshCustomCommands } from "@/cli/commands/custom";
@@ -19,13 +18,10 @@ import {
   gatherInitGitContext,
 } from "@/cli/helpers/init-command";
 import { getReflectionSettings } from "@/cli/helpers/memory-reminder";
+import { parseReflectCommandArgs } from "@/cli/helpers/reflect-command";
 import { launchReflectionSubagent } from "@/cli/helpers/reflection-launcher";
 import { buildModCommandPrompt } from "@/cli/mods/command-runtime";
-import {
-  DEFAULT_SUMMARIZATION_MODEL,
-  SYSTEM_REMINDER_CLOSE,
-  SYSTEM_REMINDER_OPEN,
-} from "@/constants";
+import { DEFAULT_SUMMARIZATION_MODEL } from "@/constants";
 import { runPreCompactHooks } from "@/hooks";
 import type { ModCommand } from "@/mods/types";
 import { markPostCompactionContextRemindersPending } from "@/reminders/state";
@@ -51,7 +47,6 @@ import {
   emitDeviceStatusUpdate,
 } from "./protocol-outbound";
 import { flushRemoteSettingsWrites } from "./remote-settings";
-import { clearConversationRuntimeState, emitListenerStatus } from "./runtime";
 import {
   ensureSecretsHydratedForAgent,
   invalidateSecretsCacheForAgent,
@@ -64,6 +59,14 @@ import {
 import type { ConversationRuntime, StartListenerOptions } from "./types";
 
 export { SUPPORTED_REMOTE_COMMANDS } from "./listener-constants";
+
+/**
+ * Reply sent to clients that still dispatch the removed remote `/clear` and
+ * `/clear-messages` commands. Kept as a plain unsuccessful command result so an
+ * older web/Desktop build surfaces it like any other command failure.
+ */
+const REMOVED_CLEAR_COMMAND_MESSAGE =
+  "/clear was removed; use /new to start a fresh conversation.";
 
 /**
  * Handle an `execute_command` message from the web app.
@@ -111,19 +114,23 @@ export async function handleExecuteCommand(
 
     switch (command.command_id) {
       case "clear":
-        output = await handleClearCommand(socket, conversationRuntime, {
-          ...opts,
-          actingUserId: command.runtime.acting_user_id,
-        });
-        break;
-
       case "clear-messages":
-        output = await handleClearCommand(socket, conversationRuntime, {
-          ...opts,
-          actingUserId: command.runtime.acting_user_id,
-          resetAllAgentMessages: true,
+        // Removed: the remote clear reassigned `conversationId` on a runtime
+        // whose `key` still addressed the old scope, so the next accepted
+        // input was written to the durable ledger under a mismatched identity
+        // and poisoned the whole store. Clients use /new instead. Answer
+        // old clients without touching any runtime or conversation state.
+        emitSlashCommandEnd(socket, conversationRuntime, scope, {
+          command_id: command.command_id,
+          input,
+          output: REMOVED_CLEAR_COMMAND_MESSAGE,
+          success: false,
         });
-        break;
+        emitExecuteCommandResponse(socket, command, {
+          success: false,
+          output: REMOVED_CLEAR_COMMAND_MESSAGE,
+        });
+        return;
 
       case "doctor": {
         const agentId = conversationRuntime.agentId;
@@ -162,15 +169,6 @@ export async function handleExecuteCommand(
         output = await handleInitCommand(socket, conversationRuntime, opts);
         break;
 
-      case "remember":
-        output = await handleRememberCommand(
-          socket,
-          conversationRuntime,
-          trimmedArgs,
-          opts,
-        );
-        break;
-
       case "compact":
         output = await handleCompactCommand(
           socket,
@@ -185,8 +183,15 @@ export async function handleExecuteCommand(
         emitDeviceStatusUpdate(socket, conversationRuntime, scope);
         break;
 
+      case "dream":
       case "reflect":
-        output = await handleReflectCommand(socket, conversationRuntime);
+      case "reflection":
+        output = await handleReflectCommand(
+          socket,
+          conversationRuntime,
+          trimmedArgs,
+          command.runtime.acting_user_id,
+        );
         break;
 
       case "context-limit":
@@ -639,81 +644,6 @@ async function handleCompactCommand(
 }
 
 /**
- * /clear — Reset agent messages and create a new conversation.
- *
- * Mirrors the CLI /clear logic:
- * 1. Reset agent messages (only for "default" conversation)
- * 2. Create a new conversation
- * 3. Clear the conversation runtime state
- *
- * Returns a human-readable success message.
- */
-async function handleClearCommand(
-  _socket: WebSocket,
-  conversationRuntime: ConversationRuntime,
-  opts: {
-    onStatusChange?: StartListenerOptions["onStatusChange"];
-    connectionId?: string;
-    /** Cloud user id stamped on the relayed frame; echoed on the create call. */
-    actingUserId?: string;
-    /** Whether to reset the API agent's complete message history. */
-    resetAllAgentMessages?: boolean;
-  },
-): Promise<string> {
-  const backend = getBackend();
-  const agentId = conversationRuntime.agentId;
-
-  if (!agentId) {
-    throw new Error("No agent ID available for /clear command");
-  }
-
-  if (opts.resetAllAgentMessages && backend.capabilities.localModelCatalog) {
-    throw new Error("/clear-messages is not supported by the local backend.");
-  }
-
-  // /clear-messages always resets the API agent's message history.
-  // /clear only resets when leaving the default API conversation.
-  // Local/headless backends model /clear by switching to a fresh conversation.
-  if (
-    !backend.capabilities.localModelCatalog &&
-    (opts.resetAllAgentMessages ||
-      conversationRuntime.conversationId === "default")
-  ) {
-    const { getClient } = await import("@/backend/api/client");
-    const client = await getClient();
-    await client.agents.messages.reset(agentId, {
-      add_default_initial_messages: false,
-    });
-  }
-
-  // Create a new conversation, attributing it to the human who ran
-  // /clear when the frame was relayed by cloud with an acting user.
-  const conversation = await backend.createConversation(
-    {
-      agent_id: agentId,
-    },
-    actingUserRequestOptions(opts.actingUserId),
-  );
-
-  // Clear runtime state for the current conversation
-  clearConversationRuntimeState(conversationRuntime);
-
-  // Update the runtime's conversation ID to the new one
-  conversationRuntime.conversationId = conversation.id;
-
-  // Emit updated status so the web app picks up the new conversation
-  emitListenerStatus(
-    conversationRuntime.listener,
-    opts.onStatusChange,
-    opts.connectionId,
-  );
-
-  return opts.resetAllAgentMessages
-    ? "All agent messages reset"
-    : "Agent's in-context messages cleared & moved to conversation history";
-}
-
-/**
  * /init — Initialize (or re-init) agent memory.
  *
  * Builds the init system-reminder message (same as the CLI /init)
@@ -763,61 +693,6 @@ async function handleInitCommand(
   );
 
   return "Memory initialization completed";
-}
-
-/**
- * /remember — Store information from the conversation.
- *
- * Mirrors the CLI /remember logic by sending the remember system reminder
- * and optional user-provided text through the normal turn pipeline.
- */
-async function handleRememberCommand(
-  socket: WebSocket,
-  conversationRuntime: ConversationRuntime,
-  args: string | undefined,
-  opts: {
-    onStatusChange?: StartListenerOptions["onStatusChange"];
-    connectionId?: string;
-  },
-): Promise<string> {
-  const agentId = conversationRuntime.agentId;
-
-  if (!agentId) {
-    throw new Error("No agent ID available for /remember command");
-  }
-
-  const hasArgs = Boolean(args && args.length > 0);
-  const rememberReminder = hasArgs
-    ? `${SYSTEM_REMINDER_OPEN}\n${REMEMBER_PROMPT}\n${SYSTEM_REMINDER_CLOSE}`
-    : `${SYSTEM_REMINDER_OPEN}\n${REMEMBER_PROMPT}\n\nThe user did not specify what to remember. Look at the recent conversation context to identify what they likely want you to remember, or ask them to clarify.\n${SYSTEM_REMINDER_CLOSE}`;
-
-  const content = hasArgs
-    ? [
-        { type: "text" as const, text: rememberReminder },
-        { type: "text" as const, text: args as string },
-      ]
-    : [{ type: "text" as const, text: rememberReminder }];
-
-  await handleIncomingMessage(
-    {
-      type: "message",
-      agentId,
-      conversationId: conversationRuntime.conversationId,
-      messages: [
-        {
-          type: "message",
-          role: "user",
-          content,
-        },
-      ],
-    },
-    socket,
-    conversationRuntime,
-    opts.onStatusChange,
-    opts.connectionId,
-  );
-
-  return "Memory request submitted";
 }
 
 /** /context-limit — Set or reset the active scope's max context window. */
@@ -880,47 +755,64 @@ async function handleChannelsCommand(
 async function handleReflectCommand(
   socket: WebSocket,
   conversationRuntime: ConversationRuntime,
+  args = "",
+  actingUserId?: string,
 ): Promise<string> {
   const agentId = conversationRuntime.agentId;
-  if (!agentId) return "No agent ID available for reflection.";
+  if (!agentId) throw new Error("No agent ID available for reflection.");
   const conversationId = conversationRuntime.conversationId;
   const listener = conversationRuntime.listener;
-  const result = await launchReflectionSubagent({
-    agentId,
-    conversationId,
-    memfsEnabled: settingsManager.isMemfsEnabled(agentId),
-    triggerSource: "manual",
-    description: "Reflecting on conversation",
-    recompileByConversation: listener.systemPromptRecompileByConversation,
-    recompileQueuedByConversation:
-      listener.queuedSystemPromptRecompileByConversation,
-    onCompletionMessage: async (completionMessage, reflectionResult) => {
-      const reflectionAgentIdTag = reflectionResult.reflectionAgentId
-        ? `<reflection-agent-id>${escapeTaskNotificationSummary(reflectionResult.reflectionAgentId)}</reflection-agent-id>`
-        : "";
-      emitCanonicalMessageDelta(
-        socket,
-        conversationRuntime,
-        {
-          type: "message",
-          id: `user-msg-${crypto.randomUUID()}`,
-          date: new Date().toISOString(),
-          message_type: "user_message",
-          content: [
-            {
-              type: "text",
-              text: `<task-notification><summary>${escapeTaskNotificationSummary(completionMessage)}</summary>${reflectionAgentIdTag}</task-notification>`,
-            },
-          ],
-        } as StreamDelta,
-        { agent_id: agentId, conversation_id: conversationId },
-      );
+  const output = await requestCloudReflectionRun(
+    { agentId, conversationId, actingUserId },
+    args,
+  );
+  if (output !== null) return output;
+  const parsed = parseReflectCommandArgs(`/reflect ${args}`);
+  if (parsed.kind !== "single") {
+    throw new Error(
+      "The remote listener supports only the current conversation and --instruction. Use the TUI for --recent, --conversation, or --auto with Code-managed reflection.",
+    );
+  }
+  const result = await launchReflectionSubagent(
+    {
+      instruction: parsed.instruction,
+      agentId,
+      conversationId,
+      memfsEnabled: settingsManager.isMemfsEnabled(agentId),
+      triggerSource: "manual",
+      description: "Reflecting on conversation",
+      recompileByConversation: listener.systemPromptRecompileByConversation,
+      recompileQueuedByConversation:
+        listener.queuedSystemPromptRecompileByConversation,
+      onCompletionMessage: async (completionMessage, reflectionResult) => {
+        const reflectionAgentIdTag = reflectionResult.reflectionAgentId
+          ? `<reflection-agent-id>${escapeTaskNotificationSummary(reflectionResult.reflectionAgentId)}</reflection-agent-id>`
+          : "";
+        emitCanonicalMessageDelta(
+          socket,
+          conversationRuntime,
+          {
+            type: "message",
+            id: `user-msg-${crypto.randomUUID()}`,
+            date: new Date().toISOString(),
+            message_type: "user_message",
+            content: [
+              {
+                type: "text",
+                text: `<task-notification><summary>${escapeTaskNotificationSummary(completionMessage)}</summary>${reflectionAgentIdTag}</task-notification>`,
+              },
+            ],
+          } as StreamDelta,
+          { agent_id: agentId, conversation_id: conversationId },
+        );
+      },
     },
-  });
+    { isCutover: async () => false },
+  ); // Ownership was resolved with the acting user above.
   if (result.launched)
     return "Started a reflection pass for this conversation.";
   if (result.reason === "memfs_disabled") {
-    return "Reflection needs the memory filesystem to be enabled for this agent. Use /remember for a lightweight memory update instead.";
+    return "Reflection needs the memory filesystem to be enabled for this agent.";
   }
   if (result.reason === "already_active") {
     return "A reflection agent is already running for this conversation.";

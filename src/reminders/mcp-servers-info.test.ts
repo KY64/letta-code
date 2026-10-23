@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { runWithRuntimeContext } from "@/runtime-context";
 import {
   buildMcpServersInfoReminderText,
   type McpServersReminderDependencies,
@@ -13,11 +14,38 @@ async function buildReminder(
 ) {
   return await buildMcpServersInfoReminderText(
     { agent: { id: MCP_AGENT_ID, name: null }, state },
-    deps,
+    { lookupParentAgent: async () => undefined, ...deps },
   );
 }
 
 describe("mcp servers info reminder", () => {
+  test("fresh workers discover both MCP placements using the inherited scope", async () => {
+    const text = await runWithRuntimeContext(
+      {
+        executionSettings: {
+          allowed_tools: [],
+          disallowed_tools: [],
+          disable_memory_guard: false,
+          parent_agent_id: "parent",
+          agent_role: "subagent",
+        },
+      },
+      () =>
+        buildReminder(createSharedReminderState(), {
+          lookupParentAgent: async (id) =>
+            id === MCP_AGENT_ID ? "parent" : undefined,
+          getLocalServerNames: (id) => {
+            expect(id).toBe("parent");
+            return ["filesystem"];
+          },
+          listServerSideServers: async (id) => {
+            expect(id).toBe("parent");
+            return [{ name: "linear", toolCount: 3 }];
+          },
+        }),
+    );
+    expect(text).toContain("filesystem, linear (3 tools)");
+  });
   test("reports None once when no servers are available", async () => {
     const state = createSharedReminderState();
     const deps: McpServersReminderDependencies = {
@@ -27,6 +55,9 @@ describe("mcp servers info reminder", () => {
 
     const initial = await buildReminder(state, deps);
     expect(initial).toContain("MCP servers with available tools: None");
+    expect(initial).toContain(
+      "Do not automatically store results of principal-restricted operations in shared memory.",
+    );
 
     expect(await buildReminder(state, deps)).toBeNull();
   });
@@ -49,6 +80,9 @@ describe("mcp servers info reminder", () => {
     expect(text).toContain("letta mcp tools <server>");
     expect(text).toContain("letta mcp schema <tool-name>");
     expect(text).toContain("letta mcp call <tool-name>");
+    expect(text).toContain(
+      "Do not automatically store results of principal-restricted operations in shared memory.",
+    );
   });
 
   test("stays silent when an available backend fails to list servers", async () => {

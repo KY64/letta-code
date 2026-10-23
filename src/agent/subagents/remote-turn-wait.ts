@@ -1,10 +1,11 @@
 import { updateSubagent } from "@/agent/subagent-state.js";
 import type { SubagentResult } from "@/agent/subagents";
+import { getBackend } from "@/backend";
 import {
   type EnqueueReceipt,
-  getLatestConversationSuperRun,
+  getEnqueueAgentId,
+  getExactSuperRun,
   listEnqueuedRunMessages,
-  openConversationStatusStream,
 } from "@/backend/api/conversation-enqueue";
 import { buildAgentReference } from "@/cli/helpers/app-urls";
 import { INTERRUPTED_BY_USER } from "@/constants";
@@ -22,16 +23,18 @@ export async function collectRemoteTurnResult(
 ): Promise<SubagentResult> {
   const startedAt = Date.now();
   updateSubagent(subagentId, {
-    agentId: receipt.agent_id,
+    agentId: receipt.agent_id ?? undefined,
     conversationId: receipt.conversation_id,
-    agentURL: buildAgentReference(receipt.agent_id, {
+    agentURL: buildAgentReference(getEnqueueAgentId(receipt), {
       conversationId: receipt.conversation_id,
     }),
   });
   try {
+    const backend = getBackend();
     const reply = await waitForAcceptedSuperRun(receipt, signal, {
-      open: openConversationStatusStream,
-      latest: getLatestConversationSuperRun,
+      exact: getExactSuperRun,
+      run: (runId, readSignal) =>
+        backend.retrieveRun(runId, { signal: readSignal }),
       messages: async (runId, readSignal) => {
         const messages = await listEnqueuedRunMessages(runId, readSignal);
         for (const message of messages) {
@@ -47,7 +50,7 @@ export async function collectRemoteTurnResult(
       },
     });
     return {
-      agentId: receipt.agent_id,
+      agentId: receipt.agent_id ?? "",
       conversationId: receipt.conversation_id,
       report: reply.text,
       success: true,
@@ -64,7 +67,7 @@ export async function collectRemoteTurnResult(
         : `${INTERRUPTED_BY_USER} (could not confirm cancellation of remote Super Run ${receipt.super_run_id})`;
     }
     return {
-      agentId: receipt.agent_id,
+      agentId: receipt.agent_id ?? "",
       conversationId: receipt.conversation_id,
       report: "",
       success: false,

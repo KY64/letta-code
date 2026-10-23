@@ -38,6 +38,7 @@ export interface ExecutionState {
     stepCount?: number;
   } | null;
   displayedToolCalls: Set<string>;
+  toolCallStatuses: Map<string, "success" | "error">;
 }
 
 /**
@@ -120,24 +121,56 @@ function handleToolCallEvent(
   }
 }
 
+function handleToolReturnEvent(
+  event: {
+    tool_call_id?: string;
+    status?: string;
+    tool_returns?: Array<{
+      tool_call_id?: string;
+      status?: string;
+    }>;
+  },
+  state: ExecutionState,
+): void {
+  const returns = Array.isArray(event.tool_returns)
+    ? event.tool_returns
+    : [event];
+
+  for (const toolReturn of returns) {
+    const toolCallId = toolReturn.tool_call_id;
+    if (!toolCallId) continue;
+    if (toolReturn.status === "success" || toolReturn.status === "error") {
+      state.toolCallStatuses.set(toolCallId, toolReturn.status);
+    }
+  }
+}
+
 /**
  * Handle a result event
  */
 function isEnqueueReceipt(event: {
   status?: unknown;
   agent_id?: unknown;
+  parent_agent_id?: unknown;
   conversation_id?: unknown;
   client_message_id?: unknown;
   super_run_id?: unknown;
   workflow_id?: unknown;
+  acting_user_id?: unknown;
 }): event is EnqueueReceipt {
   return (
     event.status === "queued" &&
-    typeof event.agent_id === "string" &&
+    (typeof event.agent_id === "string" ||
+      (event.agent_id === null && typeof event.parent_agent_id === "string")) &&
+    (event.parent_agent_id === undefined ||
+      typeof event.parent_agent_id === "string") &&
     typeof event.conversation_id === "string" &&
     typeof event.client_message_id === "string" &&
     typeof event.super_run_id === "string" &&
-    typeof event.workflow_id === "string"
+    typeof event.workflow_id === "string" &&
+    (event.acting_user_id === undefined ||
+      event.acting_user_id === null ||
+      typeof event.acting_user_id === "string")
   );
 }
 
@@ -166,11 +199,13 @@ function handleResultEvent(
     num_turns?: number;
     status?: unknown;
     agent_id?: unknown;
+    parent_agent_id?: unknown;
     conversation_id?: unknown;
     client_message_id?: unknown;
     super_run_id?: unknown;
     workflow_id?: unknown;
     connection_id?: unknown;
+    acting_user_id?: unknown;
   },
   state: ExecutionState,
   subagentId: string,
@@ -180,6 +215,9 @@ function handleResultEvent(
       state.enqueueReceipt = {
         status: "queued",
         agent_id: event.agent_id,
+        ...(event.parent_agent_id
+          ? { parent_agent_id: event.parent_agent_id }
+          : {}),
         conversation_id: event.conversation_id,
         client_message_id: event.client_message_id,
         super_run_id: event.super_run_id,
@@ -187,6 +225,9 @@ function handleResultEvent(
         ...(typeof event.connection_id === "string"
           ? { connection_id: event.connection_id }
           : {}),
+        ...(event.acting_user_id === undefined
+          ? {}
+          : { acting_user_id: event.acting_user_id }),
       };
     } else {
       state.finalError =
@@ -241,6 +282,9 @@ export function processStreamEvent(
         if (event.message_type === "tool_call_message") {
           handleToolCallEvent(event, state, subagentId);
         }
+        if (event.message_type === "tool_return_message") {
+          handleToolReturnEvent(event, state);
+        }
         emitStreamEvent(subagentId, event);
         break;
 
@@ -255,6 +299,16 @@ export function processStreamEvent(
   } catch {
     // Not valid JSON, ignore
   }
+}
+
+/** Whether at least one identified tool call reached a successful terminal state. */
+export function hasSuccessfulToolCall(state: ExecutionState): boolean {
+  for (const toolCallId of state.displayedToolCalls) {
+    if (state.toolCallStatuses.get(toolCallId) === "success") {
+      return true;
+    }
+  }
+  return false;
 }
 
 /**

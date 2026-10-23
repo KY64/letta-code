@@ -1,5 +1,5 @@
-import { getDesktopAccessToken } from "@/auth/desktop-credentials";
 import { LETTA_CLOUD_API_URL } from "@/auth/oauth";
+import { getSessionAccessToken } from "@/auth/org-credentials-session";
 import { settingsManager } from "@/settings-manager";
 import { getLettaCodeHeaders } from "./http-headers";
 
@@ -16,6 +16,8 @@ export interface ApiFetchOptions {
   signal?: AbortSignal;
   baseUrl?: string;
   apiKey?: string;
+  /** `null` suppresses the inherited headless acting user for this request. */
+  actingUserId?: string | null;
   headers?: Record<string, string>;
   query?: Record<string, string | number | boolean | null | undefined>;
 }
@@ -25,13 +27,16 @@ export class ApiRequestError extends Error {
     message: string,
     readonly status: number,
     readonly responseText: string,
+    readonly headers?: Headers,
   ) {
     super(message);
     this.name = "ApiRequestError";
   }
 }
 
-export async function getApiRequestConfig(): Promise<ApiRequestConfig> {
+export async function getApiRequestConfig(options?: {
+  signal?: AbortSignal;
+}): Promise<ApiRequestConfig> {
   const settings = await settingsManager.getSettingsWithSecureTokens();
   return {
     baseUrl:
@@ -39,7 +44,11 @@ export async function getApiRequestConfig(): Promise<ApiRequestConfig> {
       settings.env?.LETTA_BASE_URL ||
       LETTA_CLOUD_API_URL,
     apiKey:
-      getDesktopAccessToken() ||
+      // The caller's abort budget reaches the OAuth refresh beneath the
+      // session token lookup (evil-shub round-9 P1): apiFetch observes
+      // options.signal on its own fetch but the refresh PRE-fetch used to
+      // run unbounded, hanging the caller past its deadline.
+      (await getSessionAccessToken(options)) ||
       process.env.LETTA_API_KEY ||
       settings.env?.LETTA_API_KEY ||
       "",
@@ -80,7 +89,9 @@ export async function apiFetch(
 ): Promise<Response> {
   const config =
     options.baseUrl === undefined || options.apiKey === undefined
-      ? await getApiRequestConfig()
+      ? await getApiRequestConfig(
+          options.signal !== undefined ? { signal: options.signal } : undefined,
+        )
       : null;
   const baseUrl = options.baseUrl ?? config?.baseUrl;
   const apiKey = options.apiKey ?? config?.apiKey ?? "";
@@ -101,7 +112,7 @@ export async function apiFetch(
   return fetch(url, {
     method: options.method ?? "GET",
     headers: {
-      ...getLettaCodeHeaders(apiKey),
+      ...getLettaCodeHeaders(apiKey, options.actingUserId),
       ...options.headers,
     },
     ...(options.body && { body: JSON.stringify(options.body) }),
@@ -131,6 +142,7 @@ export async function apiRequest<T>(
       `API error (${response.status}): ${text}`,
       response.status,
       text,
+      response.headers,
     );
   }
 

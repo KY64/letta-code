@@ -18,6 +18,16 @@ describe("subagent name allocation", () => {
     expect(allocate()).toBe("Deckard the 2nd");
   });
 
+  test("pool has no near-duplicates that differ only by case or punctuation", () => {
+    const normalized = SUBAGENT_NAMES.map((name) =>
+      name.toLowerCase().replace(/[^a-z0-9]/g, ""),
+    );
+    const repeated = normalized.filter(
+      (name, index) => normalized.indexOf(name) !== index,
+    );
+    expect(repeated).toEqual([]);
+  });
+
   test("uses the random choice among names that remain, rather than retrying duplicates", () => {
     const allocate = createSubagentNameAllocator(() => 0.999999);
     const last = `${SUBAGENT_NAMES.at(-1)}`;
@@ -67,15 +77,12 @@ describe("subagent name allocation", () => {
     expect(new Set(names).size).toBe(SUBAGENT_NAMES.length);
   });
 
-  test("labels each new agent as its own parent's shadow", () => {
-    expect(allocateSubagentName("Bob")).toEndWith(" (Bob's shadow)");
-    expect(allocateSubagentName("Alice")).toEndWith(" (Alice's shadow)");
-    expect(allocateSubagentName("  Bob  ")).toEndWith(" (Bob's shadow)");
-  });
-
-  test("uses shadow when no parent name is available", () => {
-    for (const parent of [undefined, null, "", "  "]) {
-      expect(allocateSubagentName(parent)).toEndWith(" (shadow)");
+  test("does not expose the parent name in generated subagent names", () => {
+    for (const parent of ["Bob", "Alice", "  Bob  ", undefined, null, ""]) {
+      const name = allocateSubagentName(parent);
+      expect(name).not.toContain("shadow");
+      expect(name).not.toContain("Bob");
+      expect(name).not.toContain("Alice");
     }
   });
 });
@@ -90,8 +97,8 @@ describe("new agent name selection", () => {
   test("standalone subagent creation also receives a generated name", () => {
     const first = resolveCreatedAgentName(undefined, true);
     const second = resolveCreatedAgentName(undefined, true);
-    expect(first).toEndWith(" (shadow)");
-    expect(second).toEndWith(" (shadow)");
+    expect(first).not.toContain("shadow");
+    expect(second).not.toContain("shadow");
     expect(first).not.toBe(second);
   });
 

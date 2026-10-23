@@ -9,6 +9,7 @@ import type { EnqueueReceipt } from "@/backend/api/conversation-enqueue";
 import type { RuntimeExecutionSettings } from "@/runtime-execution-settings";
 import type {
   AgentRuntimeScope,
+  ConversationRuntimeScope,
   LoopState,
   WsProtocolCommand,
 } from "@/types/protocol_v2";
@@ -24,15 +25,18 @@ const scope: AgentRuntimeScope = {
   conversation_id: "conv-child",
   acting_user_id: "user-parent",
 };
+const scopes = [scope, { ...scope, agent_id: null }];
 const settings: RuntimeExecutionSettings = {
   parent_agent_id: "agent-parent",
-  agent_role: "subagent",
   allowed_tools: ["Read"],
   disallowed_tools: ["Write"],
   disable_memory_guard: false,
   max_turns: 10,
 };
-function transport(supportsSettings = true) {
+function transport(
+  supportsSettings = true,
+  runtimeScope: ConversationRuntimeScope = scope,
+) {
   const commands: WsProtocolCommand[] = [];
   let socket!: Socket;
   class Socket extends EventEmitter {
@@ -53,7 +57,7 @@ function transport(supportsSettings = true) {
           type: "runtime_start_response",
           request_id: command.request_id,
           success: true,
-          runtime: scope,
+          runtime: runtimeScope,
           agent: null,
           conversation: null,
           created: { agent: false, conversation: false },
@@ -65,14 +69,14 @@ function transport(supportsSettings = true) {
         emit({
           type: "sync_response",
           request_id: command.request_id,
-          runtime: scope,
+          runtime: runtimeScope,
           success: true,
         });
       if (command.type === "abort_message")
         emit({
           type: "abort_message_response",
           request_id: command.request_id,
-          runtime: scope,
+          runtime: runtimeScope,
           success: true,
           aborted: true,
         });
@@ -112,6 +116,44 @@ const backend = {
   retrieveRun: async (id: string) =>
     ({ id, status: "completed", stop_reason: "end_turn" }) as Run,
 };
+
+test("listener resume keeps conversation identity separate from its parent", async () => {
+  const conversationScope = { ...scope, agent_id: null };
+  const wire = transport(true, conversationScope);
+  const result = await launchListenerConversation(
+    {
+      connectionId: "conn-target",
+      scope: conversationScope,
+      parentAgentId: "agent-parent",
+      content: "Continue the previous turn.",
+      backend,
+      settings,
+      mode: "standard",
+      noWait: true,
+    },
+    {
+      client: wire.client,
+      enqueue: async (input) => {
+        expect(wire.commands[0]).toMatchObject({
+          type: "runtime_start",
+          conversation_id: scope.conversation_id,
+        });
+        expect(wire.commands[0]).not.toHaveProperty("agent_id");
+        expect(input.agentId).toBe("agent-parent");
+        return { ...receipt(input.clientMessageId), agent_id: input.agentId };
+      },
+    },
+  );
+  expect(result).toMatchObject({
+    status: "queued",
+    receipt: {
+      agent_id: null,
+      parent_agent_id: "agent-parent",
+      conversation_id: scope.conversation_id,
+      connection_id: "conn-target",
+    },
+  });
+});
 
 test.each([
   { content: "hello" },
@@ -274,17 +316,18 @@ test("queued CLI cancellation uses the existing dequeue API, never aborts the tu
   ).toBe(false);
 });
 
-test("active cancellation targets only a run mapped to the requested input", async () => {
-  const wire = transport();
-  const dequeue = async () => ({
-    client_message_id: "own",
-    status: "too_late" as const,
-  });
+test.each(scopes)("cancels only the requested input: %j", async (scope) => {
+  const wire = transport(true, scope);
+  const dequeue = async (input: { agentId: string }) => {
+    expect(input.agentId).toBe(scope.agent_id ?? "agent-parent");
+    return { client_message_id: "own", status: "too_late" as const };
+  };
   try {
     expect(
       await cancelListenerInput({
         client: wire.client,
         scope,
+        parentAgentId: "agent-parent",
         clientMessageId: "own",
         dequeue,
         readState: () => ({ loop: loop("someone-else"), cancelled: false }),
@@ -297,6 +340,7 @@ test("active cancellation targets only a run mapped to the requested input", asy
       await cancelListenerInput({
         client: wire.client,
         scope,
+        parentAgentId: "agent-parent",
         clientMessageId: "own",
         dequeue,
         readState: () => ({ loop: loop("own"), cancelled: false }),
@@ -538,7 +582,53 @@ test.each(["run", "messages", "super-run"] as const)(
   },
 );
 
-test("noWait returns the enqueue receipt once Cloud accepts the send and reads nothing else", async () => {
+test("initial assignment identity survives enqueue without leaking into later launches", async () => {
+  const submitted: string[] = [];
+  for (const clientMessageId of [
+    "assignment:initial-input",
+    undefined,
+    undefined,
+  ]) {
+    const wire = transport();
+    const result = await launchListenerConversation(
+      {
+        connectionId: "conn-target",
+        scope,
+        content: "work",
+        clientMessageId,
+        backend,
+        settings,
+        mode: "standard",
+        noWait: true,
+      },
+      {
+        client: wire.client,
+        enqueue: async (input) => {
+          submitted.push(input.clientMessageId);
+          return receipt(input.clientMessageId);
+        },
+      },
+    );
+    expect(result).toMatchObject({
+      status: "queued",
+      receipt: { client_message_id: submitted.at(-1) },
+    });
+    expect(wire.commands[0]).not.toHaveProperty("client_message_id");
+    expect(wire.commands[0]).not.toMatchObject({
+      request_id: submitted.at(-1),
+    });
+    expect(settings).not.toHaveProperty("client_message_id");
+  }
+  expect(submitted[0]).toBe("assignment:initial-input");
+  for (const id of submitted.slice(1)) {
+    expect(id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+  }
+  expect(new Set(submitted).size).toBe(3);
+});
+
+test("noWait returns a receipt for a tracked Agent launch", async () => {
   // The Agent tool's child uses this: it configures the listener, submits,
   // and exits. The parent process follows the remote turn from the receipt.
   const wire = transport();
@@ -556,13 +646,7 @@ test("noWait returns the enqueue receipt once Cloud accepts the send and reads n
     },
     {
       client: wire.client,
-      enqueue: async (input) => {
-        expect(wire.commands[0]).toMatchObject({
-          type: "runtime_start",
-          execution_settings: settings,
-        });
-        return receipt(input.clientMessageId);
-      },
+      enqueue: async (input) => receipt(input.clientMessageId),
       listRunMessages,
     },
   );
@@ -575,4 +659,46 @@ test("noWait returns the enqueue receipt once Cloud accepts the send and reads n
   });
   expect(retrieveRun).not.toHaveBeenCalled();
   expect(listRunMessages).not.toHaveBeenCalled();
+});
+
+test("subagent identity does not make an ordinary CLI launch return early", async () => {
+  const wire = transport();
+  const executionSettings = { ...settings, agent_role: "subagent" as const };
+  const result = await launchListenerConversation(
+    {
+      connectionId: "conn-target",
+      scope,
+      content: "hello",
+      backend,
+      settings: executionSettings,
+      mode: "standard",
+    },
+    {
+      client: wire.client,
+      enqueue: async (input) => {
+        wire.emit({
+          type: "update_loop_status",
+          runtime: scope,
+          loop_status: loop(input.clientMessageId, false),
+        });
+        wire.emit({
+          type: "turn_finished",
+          runtime: scope,
+          run_id: "run-own",
+          stop_reason: "end_turn",
+        });
+        return receipt(input.clientMessageId);
+      },
+      listRunMessages: async () =>
+        [
+          {
+            id: "message-final",
+            date: "now",
+            message_type: "assistant_message",
+            content: "Done",
+          },
+        ] as Message[],
+    },
+  );
+  expect(result).toMatchObject({ status: "completed", text: "Done" });
 });

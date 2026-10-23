@@ -1,9 +1,7 @@
 /**
  * Protocol V2 (alpha hard-cut contract)
- *
  * This file defines the runtime-scoped websocket contract for device-mode UIs.
- * It is intentionally self-defined and does not import transport/event shapes
- * from the legacy protocol.ts surface.
+ * It is self-defined rather than importing legacy transport/event shapes.
  */
 
 import type {
@@ -30,7 +28,8 @@ import type {
   MessageListParams,
 } from "@letta-ai/letta-client/resources/conversations/messages";
 import type { StopReasonType } from "@letta-ai/letta-client/resources/runs/runs";
-import type { ChatGPTOAuthConfig } from "@/types/chatgpt-oauth";
+import type { ConnectProviderOAuthConfig } from "@/types/provider-oauth-config";
+import type { TurnFinishedAckCommand } from "@/types/turn-finished-protocol";
 import type {
   AppServerInfoCommand,
   AppServerInfoResponseMessage,
@@ -40,6 +39,14 @@ import type {
   UmiLifecycleMessageBase,
 } from "./approval-classification-protocol";
 import type { BackgroundProcessSummary } from "./background-process-protocol";
+import type {
+  ChatGPTRateLimitResetCreditConsumeCommand,
+  ChatGPTRateLimitResetCreditConsumeResponseMessage,
+  ChatGPTRateLimitResetCreditsListCommand,
+  ChatGPTRateLimitResetCreditsListResponseMessage,
+  ChatGPTUsageReadCommand,
+  ChatGPTUsageReadResponseMessage,
+} from "./chatgpt-usage-protocol";
 import type { ConversationForkBody } from "./conversation-fork-protocol";
 import type * as CwdProtocol from "./cwd-protocol";
 import type {
@@ -48,7 +55,17 @@ import type {
   RuntimeExternalToolsUpdateCommand,
   RuntimeExternalToolsUpdateResponseMessage,
 } from "./external-tool-protocol";
-import type { LoopState } from "./loop-status-protocol";
+import type {
+  WriteFileCommand,
+  WriteFileResponseMessage,
+} from "./file-write-protocol";
+import type { InputCommand } from "./input-command";
+import type {
+  LoopErrorMessage,
+  LoopState,
+  RetryMessage,
+  StatusMessage,
+} from "./loop-status-protocol";
 import type {
   AgentRuntimeScope,
   ConversationRuntimeScope,
@@ -62,12 +79,11 @@ import type {
   CronProtocolCommand,
   CronProtocolResponseMessage,
 } from "./schedule-protocol";
-import type {
-  MonitorStopCommand,
-  MonitorStopResponse,
-  RemoveQueueItemCommand,
-  RemoveQueueItemResponse,
-} from "./task-control-protocol";
+import type * as SubagentProtocol from "./subagent-protocol";
+import type * as TaskControlProtocol from "./task-control-protocol";
+
+export type * from "./subagent-protocol";
+
 import type * as TeleportProtocol from "./teleport-protocol";
 import type {
   ToolsetName,
@@ -77,8 +93,10 @@ import type {
 
 export type * from "./approval-classification-protocol";
 export type * from "./background-process-protocol";
+export type * from "./chatgpt-usage-protocol";
 export type * from "./cwd-protocol";
 export type * from "./external-tool-protocol";
+export type * from "./file-write-protocol";
 export type * from "./loop-status-protocol";
 export type * from "./runtime-scope";
 export type * from "./runtime-start-protocol";
@@ -88,12 +106,12 @@ export type * from "./teleport-protocol";
 export type * from "./toolset-protocol";
 
 export type DmPolicy = "pairing" | "allowlist" | "open";
-
 export type ExperimentId =
   | "artifacts"
   | "conversation_titles"
   | "desktop_conversation_bootstrap"
   | "diffs"
+  | "memory_palace"
   | "reflection_arena"
   | "tui_cron";
 
@@ -117,13 +135,6 @@ export interface RuntimeEnvelope {
   event_seq: number;
   emitted_at: string;
   idempotency_key: string;
-}
-
-export interface ClientToolsetConfig {
-  /** Request-scoped base toolset. Omitted preserves the runtime preference. */
-  base?: ToolsetPreference;
-  /** Additional bundled client tools to load before applying the allowlist. */
-  include?: string[];
 }
 
 export interface AvailableSkillSummary {
@@ -195,8 +206,6 @@ export interface ReflectionSettingsSnapshot {
 export type ChannelId = string;
 
 export type ChannelPluginConfig = Record<string, unknown>;
-
-// ── Channel config schema (declarative plugin UI) ──
 
 export interface ChannelConfigFieldBase {
   key: string;
@@ -458,9 +467,7 @@ export interface QueueUpdateMessage extends RuntimeEnvelope {
   removed: import("./queue-update-protocol").QueueRemovalTransition[];
 }
 
-/**
- * Standard Letta message delta forwarded through the stream channel.
- */
+/** Standard Letta message delta forwarded through the stream channel. */
 export type MessageDelta = { type: "message" } & LettaStreamingResponse;
 
 export interface ClientToolStartMessage extends UmiLifecycleMessageBase {
@@ -506,35 +513,6 @@ export interface SlashCommandEndMessage extends UmiLifecycleMessageBase {
   success: boolean;
 }
 
-export interface StatusMessage extends UmiLifecycleMessageBase {
-  message_type: "status";
-  message: string;
-  level: "info" | "success" | "warning";
-}
-
-export interface RetryMessage extends UmiLifecycleMessageBase {
-  message_type: "retry";
-  message: string;
-  reason: StopReasonType;
-  attempt: number;
-  max_attempts: number;
-  delay_ms: number;
-  retry_kind?: "provider_retry" | "transport_fallback";
-  provider?: string;
-  from_transport?: string | null;
-  to_transport?: string | null;
-  error_code?: string | null;
-  step_id?: string | null;
-}
-
-export interface LoopErrorMessage extends UmiLifecycleMessageBase {
-  message_type: "loop_error";
-  message: string;
-  stop_reason: StopReasonType;
-  is_terminal: boolean;
-  api_error?: LettaStreamingResponse.LettaErrorMessage;
-}
-
 export type StreamDelta =
   | MessageDelta
   | ApprovalClassificationEndMessage
@@ -558,6 +536,7 @@ export interface TurnFinishedMessage extends RuntimeEnvelope {
   type: "turn_finished";
   turn_id: string;
   stop_reason: StopReasonType;
+  terminal_consumer_ids?: string[];
   run_id?: string;
   error?: string;
   /** Final CLI counters, independent of control/stream socket delivery order. */
@@ -577,11 +556,12 @@ export interface SubagentSnapshot {
   prompt?: string;
   status: "pending" | "running" | "completed" | "error";
   agent_url: string | null;
-  /** The subagent's own conversation id (for dual-view routing; local agents
-   * have a bare-id agent_url with no ?conversation= param to parse). */
-  conversation_id?: string | null;
+  agent_id?: string | null;
+  conversation_id?: string | null; // Own conversation; local URLs do not carry it.
+  super_run_id?: string; // Exact accepted Super Run for a remote child send.
   model?: string;
   is_background?: boolean;
+  claims_parent_runtime?: boolean;
   silent?: boolean;
   tool_call_id?: string;
   parent_agent_id?: string;
@@ -591,6 +571,8 @@ export interface SubagentSnapshot {
   total_tokens: number;
   duration_ms: number;
   error?: string;
+  /** Truncated final report, set for `notify: "caller"` launches. */
+  result?: string;
 }
 
 export interface SubagentStateUpdateMessage extends RuntimeEnvelope {
@@ -598,85 +580,25 @@ export interface SubagentStateUpdateMessage extends RuntimeEnvelope {
   subagents: SubagentSnapshot[];
 }
 
-export interface ApprovalResponseAllowDecision {
-  behavior: "allow";
-  message?: string;
-  updated_input?: Record<string, unknown> | null;
-  selected_permission_suggestion_ids?: string[];
-}
-
-export interface ApprovalResponseDenyDecision {
-  behavior: "deny";
-  message: string;
-}
-
-export type ApprovalResponseDecision =
-  | ApprovalResponseAllowDecision
-  | ApprovalResponseDenyDecision;
-
-export type ApprovalResponseBody =
-  | {
-      request_id: string;
-      decision: ApprovalResponseDecision;
-    }
-  | {
-      request_id: string;
-      error: string;
-    };
-
 /**
  * Controller -> execution-environment commands.
  * In v2, the WS server accepts runtime-scoped chat/device commands plus
  * device capability commands (filesystem, memory, cron, terminals).
  */
-export interface InputCreateMessagePayload {
-  kind: "create_message";
-  messages: Array<MessageCreate & { client_message_id?: string }>;
-  /** Handling policy for unsupported or failed image inputs. */
-  image_failure_mode?: "strict" | "drop";
-  /**
-   * Optional request-scoped allowlist for locally executed client tools.
-   * Undefined preserves the listener's normal toolset; an empty array means no
-   * client tools for this turn.
-   */
-  client_tool_allowlist?: string[];
-  /**
-   * Optional request-scoped built-in toolset selection. The base chooses the
-   * harness preset without changing persisted settings; include adds bundled
-   * client tools before the allowlist is applied.
-   */
-  client_toolset?: ClientToolsetConfig;
-  /**
-   * Optional scoped external tools to expose for this turn. Runtime-start
-   * external tools with a scope_id stay hidden unless selected here; unscoped
-   * external tools for the runtime remain available normally.
-   */
-  external_tool_scope_ids?: string[];
-  /**
-   * Exclude interactive user-input tools (AskUserQuestion and friends) from
-   * this turn's toolset. Intended for headless clients (SDK sessions,
-   * automation) that cannot surface mid-turn questions to a human. The
-   * excluded set is owned by the harness (interactive-policy), so new
-   * interactive tools are covered without client updates.
-   */
-  exclude_interactive_tools?: boolean;
-}
-
-export type InputApprovalResponsePayload = {
-  kind: "approval_response";
-} & ApprovalResponseBody;
-export type InputPayload =
-  | InputCreateMessagePayload
-  | InputApprovalResponsePayload
-  | TeleportProtocol.InputTeleportContinuePayload;
-
-export interface InputCommand {
-  type: "input";
-  /** Correlates acknowledgement without waiting for the turn to finish. */
-  request_id?: string;
-  runtime: ConversationRuntimeScope;
-  payload: InputPayload;
-}
+export type { ClientPreferences } from "./client-preferences";
+export type {
+  ApprovalResponseAllowDecision,
+  ApprovalResponseBody,
+  ApprovalResponseDecision,
+  ApprovalResponseDenyDecision,
+  InputApprovalResponsePayload,
+  InputCommand,
+  InputPayload,
+} from "./input-command";
+export type {
+  ClientToolsetConfig,
+  InputCreateMessagePayload,
+} from "./input-create-message";
 
 export interface InputAcceptedResponseMessage {
   type: "input_accepted";
@@ -942,24 +864,6 @@ export interface ReadFileResponseMessage {
   content: string | null;
   /** Encoding of `content`. Mirrors the request; "utf8" when omitted. */
   encoding?: "utf8" | "base64";
-  success: boolean;
-  error?: string;
-}
-
-export interface WriteFileCommand {
-  type: "write_file";
-  /** Absolute path to the file to write. */
-  path: string;
-  /** The full file content to write. */
-  content: string;
-  /** Echoed back in the response for request correlation. */
-  request_id: string;
-}
-
-export interface WriteFileResponseMessage {
-  type: "write_file_response";
-  request_id: string;
-  path: string;
   success: boolean;
   error?: string;
 }
@@ -1257,7 +1161,6 @@ export interface ListModelsCommand {
 }
 
 export type ConnectProviderStorageTarget = "local";
-export type ChatGPTUsageReadTarget = "local" | "api";
 
 export interface ListConnectProvidersCommand {
   type: "list_connect_providers";
@@ -1277,7 +1180,7 @@ export interface ConnectProviderCommand {
   auth_method_id?: string;
   fields: Record<string, string>;
   provider_name?: string;
-  oauth_config?: ChatGPTOAuthConfig;
+  oauth_config?: ConnectProviderOAuthConfig;
 }
 
 export interface DisconnectProviderCommand {
@@ -1290,18 +1193,6 @@ export interface DisconnectProviderCommand {
   provider_id: string;
   /** Optional connected provider name to remove when a row has multiple aliases. */
   provider_name?: string;
-}
-
-export interface ChatGPTUsageReadCommand {
-  type: "chatgpt_usage_read";
-  /** Echoed back in the response for request correlation. */
-  request_id: string;
-  /** Provider store to inspect. */
-  target: ChatGPTUsageReadTarget;
-  /** Optional connected ChatGPT provider alias. Defaults to the built-in alias. */
-  provider_name?: string;
-  /** Skip the short listener-side cache. */
-  force_refresh?: boolean;
 }
 
 export interface ConnectProviderField {
@@ -1377,65 +1268,6 @@ export interface DisconnectProviderResponseMessage {
   error?: string;
 }
 
-export interface ChatGPTUsageWindowPayload {
-  label: string;
-  usedPercent: number | null;
-  windowDurationMins: number | null;
-  resetsAt: number | null;
-}
-
-export interface ChatGPTUsageCreditsPayload {
-  balance?: string | null;
-  availableCount?: number | null;
-  hasCredits?: boolean | null;
-  unlimited?: boolean | null;
-}
-
-export interface ChatGPTUsageIndividualLimitPayload {
-  limit: string;
-  used: string;
-  remainingPercent: number;
-  resetsAt: number;
-}
-
-export interface ChatGPTUsageSnapshotPayload {
-  providerName: string;
-  fetchedAt: string;
-  summary: string;
-  planType?: string | null;
-  limitReached?: boolean | null;
-  rateLimitReachedType?: string | null;
-  primary: ChatGPTUsageWindowPayload | null;
-  secondary: ChatGPTUsageWindowPayload | null;
-  additional: ChatGPTUsageWindowPayload[];
-  credits?: ChatGPTUsageCreditsPayload | null;
-  individualLimit?: ChatGPTUsageIndividualLimitPayload | null;
-}
-
-export interface ChatGPTUsageReadErrorPayload {
-  code:
-    | "bad_request"
-    | "not_connected"
-    | "unsupported_target"
-    | "refresh_failed"
-    | "unauthorized"
-    | "forbidden"
-    | "rate_limited"
-    | "network_error"
-    | "bad_response";
-  message: string;
-  retryAfterMs?: number;
-}
-
-export interface ChatGPTUsageReadResponseMessage {
-  type: "chatgpt_usage_read_response";
-  request_id: string;
-  success: boolean;
-  target: ChatGPTUsageReadTarget;
-  usage?: ChatGPTUsageSnapshotPayload;
-  error?: ChatGPTUsageReadErrorPayload;
-}
-
 export interface UpdateModelPayload {
   /** Preferred runtime catalog model identifier (e.g. "sonnet") */
   model_id?: string;
@@ -1470,9 +1302,9 @@ export interface ListModelsResponseModelEntry {
   isDefault?: boolean;
   isFeatured?: boolean;
   free?: boolean;
+  supportsStructuredOutputs?: boolean;
   updateArgs?: Record<string, unknown>;
 }
-
 export interface ListModelsResponseMessage {
   type: "list_models_response";
   request_id: string;
@@ -2256,30 +2088,6 @@ export interface ChannelTargetsUpdatedMessage {
   channel_id: ChannelId;
 }
 
-/**
- * Generic slash-command dispatch from the web app.
- * The device handles the `command_id` and emits `command_start` /
- * `command_end` stream deltas with the result.
- */
-export interface ExecuteCommandCommand {
-  type: "execute_command";
-  /** Which slash command to run (e.g., "clear") */
-  command_id: string;
-  /** Correlation id (echoed in the response stream deltas) */
-  request_id: string;
-  /** Runtime scope — identifies which agent + conversation this targets */
-  runtime: AgentRuntimeScope;
-  /** Optional command arguments (everything after the command name). */
-  args?: string;
-}
-
-export interface ExecuteCommandResponseMessage {
-  type: "execute_command_response";
-  request_id: string;
-  success: boolean;
-  output: string;
-}
-
 // ─────────────────────────────────────────────────
 //  Git branch commands
 // ─────────────────────────────────────────────────
@@ -2393,6 +2201,7 @@ export interface SecretApplyResponse {
 }
 
 export type WsProtocolCommand =
+  | TurnFinishedAckCommand
   | InputCommand
   | ChangeDeviceStateCommand
   | AbortMessageCommand
@@ -2429,6 +2238,8 @@ export type WsProtocolCommand =
   | ConnectProviderCommand
   | DisconnectProviderCommand
   | ChatGPTUsageReadCommand
+  | ChatGPTRateLimitResetCreditsListCommand
+  | ChatGPTRateLimitResetCreditConsumeCommand
   | UpdateModelCommand
   | UpdateToolsetCommand
   | CronProtocolCommand
@@ -2475,9 +2286,12 @@ export type WsProtocolCommand =
   | ChannelTargetBindCommand
   | ChannelRouteRemoveCommand
   | ChannelRouteUpdateCommand
-  | ExecuteCommandCommand
-  | RemoveQueueItemCommand
-  | MonitorStopCommand
+  | TaskControlProtocol.BrowserDeviceMcpOAuthCommand
+  | TaskControlProtocol.BrowserDeviceMcpOAuthCancelCommand
+  | TaskControlProtocol.ExecuteCommandCommand
+  | TaskControlProtocol.RemoveQueueItemCommand
+  | SubagentProtocol.LaunchSubagentCommand
+  | TaskControlProtocol.MonitorStopCommand
   | SearchBranchesCommand
   | CheckoutBranchCommand
   | SecretListCommand
@@ -2486,10 +2300,11 @@ export type WsProtocolCommand =
 export type WsProtocolCommandType = WsProtocolCommand["type"];
 
 export type WsProtocolMessage =
+  | TaskControlProtocol.BrowserDeviceMcpOAuthResponseMessage
   | ControlRequest
   | InputAcceptedResponseMessage
   | TeleportProtocol.TeleportProtocolMessage
-  | ExecuteCommandResponseMessage
+  | TaskControlProtocol.ExecuteCommandResponseMessage
   | DeviceStatusUpdateMessage
   | LoopStatusUpdateMessage
   | QueueUpdateMessage
@@ -2527,6 +2342,8 @@ export type WsProtocolMessage =
   | ConnectProviderResponseMessage
   | DisconnectProviderResponseMessage
   | ChatGPTUsageReadResponseMessage
+  | ChatGPTRateLimitResetCreditsListResponseMessage
+  | ChatGPTRateLimitResetCreditConsumeResponseMessage
   | UpdateModelResponseMessage
   | UpdateToolsetResponseMessage
   | CronProtocolResponseMessage
@@ -2585,8 +2402,9 @@ export type WsProtocolMessage =
   | CheckoutBranchResponse
   | SecretListResponse
   | SecretApplyResponse
-  | RemoveQueueItemResponse
-  | MonitorStopResponse;
+  | TaskControlProtocol.RemoveQueueItemResponse
+  | TaskControlProtocol.MonitorStopResponse
+  | SubagentProtocol.LaunchSubagentResponse;
 
 export type WsProtocolMessageType = WsProtocolMessage["type"];
 

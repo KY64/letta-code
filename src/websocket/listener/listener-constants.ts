@@ -6,11 +6,14 @@
  * and protocol-outbound.ts.
  */
 export const SUPPORTED_REMOTE_COMMANDS: readonly string[] = [
-  "clear",
-  "clear-messages",
+  "browser_device_mcp_oauth",
+  // `clear` / `clear-messages` were removed: the remote clear corrupted the
+  // durable input ledger. Clients start a fresh conversation with /new.
   "doctor",
+  "dream",
+  "reflect",
+  "reflection",
   "init",
-  "remember",
   "compact",
   "reload",
   "context-limit",

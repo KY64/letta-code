@@ -1,4 +1,5 @@
 import { parseArgs } from "node:util";
+import { TOOLSET_OPTIONS } from "@/tools/toolset-catalog";
 
 export type CliFlagMode = "interactive" | "headless" | "both";
 export type CliBackendMode = "api" | "local";
@@ -109,8 +110,7 @@ export const CLI_FLAG_CATALOG = {
     mode: "both",
     help: {
       argLabel: "<name>",
-      description:
-        'Toolset mode: "auto", "letta", "codex", "default", or "gemini" (manual values override model-based auto-selection)',
+      description: `Toolset mode: ${TOOLSET_OPTIONS.map(({ id }) => `"${id}"`).join(", ")} (manual values override model-based auto-selection)`,
     },
   },
   prompt: {
@@ -154,6 +154,15 @@ export const CLI_FLAG_CATALOG = {
       argLabel: "<fmt>",
       description: "Output format for headless mode (text, json, stream-json)",
       continuationLines: ["Default: text"],
+    },
+  },
+  "client-message-id": {
+    parser: { type: "string" },
+    mode: "headless",
+    help: {
+      argLabel: "<id>",
+      description:
+        "Client identity for the initial Cloud input (not a command request_id)",
     },
   },
   "no-wait": {
@@ -268,12 +277,12 @@ export const CLI_FLAG_CATALOG = {
   "no-skills": {
     parser: { type: "boolean" },
     mode: "both",
-    help: { description: "Disable all skill sources" },
+    help: { description: "Disable automatic skill discovery" },
   },
   "no-bundled-skills": {
     parser: { type: "boolean" },
     mode: "both",
-    help: { description: "Disable bundled skills only" },
+    help: { description: "Disable automatic discovery of bundled skills" },
   },
   "no-system-info-reminder": {
     parser: { type: "boolean" },
@@ -404,6 +413,12 @@ export function parseCliArgs(args: string[], strict: boolean) {
     strict,
     allowPositionals: true,
   });
+  const clientMessageId = parsed.values["client-message-id"];
+  if (
+    clientMessageId !== undefined &&
+    (typeof clientMessageId !== "string" || !clientMessageId.trim())
+  )
+    throw new Error("--client-message-id must be a non-empty string");
   return {
     ...parsed,
     values: parsed.values as CliParsedValues,

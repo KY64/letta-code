@@ -6,7 +6,6 @@ Letta Code is a stateful agent harness for creating agents that are more like pe
 
 Letta Code can be used interactively, or to power always-on agents that work proactively. Interact with agents through:
 * A local [**CLI**](https://docs.letta.com/letta-code/cli)
-* The [**desktop app**](https://docs.letta.com/letta-code/desktop-app) for macOS, Windows, and Linux
 * Your browser, including [mobile](https://docs.letta.com/letta-code/remote-mobile), at [chat.letta.com](https://chat.letta.com)
 * Messaging integrations, including [Telegram](https://docs.letta.com/letta-code/channels#telegram-cli), [Slack](https://docs.letta.com/letta-code/channels#slack-cli), [Discord](https://docs.letta.com/letta-code/channels#discord-cli), and [custom channels](https://github.com/letta-ai/letta-code/blob/main/src/channels/README.md)
 
@@ -23,13 +22,15 @@ Letta Code can be used interactively, or to power always-on agents that work pro
 | [Message search](https://docs.letta.com/letta-code/slash-commands) | Search across all messages and agents with `/search`. Agent can also search their own conversations or the conversations of other agents |
 | [MemFS](https://docs.letta.com/letta-code/memfs) | All context (including memory blocks) is tracked via git. Sync context to a custom GitHub repository by setting `/memory-repository set git@github.com:...` |
 | [Skills](https://docs.letta.com/letta-code/skills) | Loads global skills (`~/.letta`), project-scoped skills (`.agents/skills`), and agent-scoped skills (stored in MemFS). View skills with `/skills` and create with `/skill-creator` |
-| [Subagents & Multi-agent](https://docs.letta.com/letta-code/subagents) | Call built-in subagents (general-purpose, forked, recall, history-analyzer) in the background. Agents can call any other agent (including themselves) as subagents |
+| [Subagents & Multi-agent](https://docs.letta.com/letta-code/subagents) | Call built-in subagents (general-purpose, forked, recall) in the background. Agents can call any other agent (including themselves) as subagents |
 | [Messaging Integrations](https://docs.letta.com/letta-code/channels) | Chat with the same agent from Slack, Telegram, your browser (chat.letta.com) including mobile, and through [custom channels](https://github.com/letta-ai/skills/blob/main/letta/creating-letta-code-channels/SKILL.md) |
 | [Hooks](https://docs.letta.com/letta-code/hooks) | Run custom scripts at key points of agent execution to automate workflows |
 | [Permissions](https://docs.letta.com/letta-code/permissions) | Set permission modes and customize what actions are auto-approved or auto-denied |
 | [Crons & Schedules](https://docs.letta.com/letta-code/scheduling) | Configure heartbeats and crons, and let agents work across time with self-managed schedules |
 | [Remote computers](https://docs.letta.com/platform/computers/byom) (requires signing in with Letta) | Agents work across multiple computers. Connect any machine by running `letta server --computer-name "..."` |
 | [Secrets](https://docs.letta.com/letta-code/secrets) (requires signing in with Letta) | Make secrets available as environment variables (across machines) while obfuscating their values from context |
+
+Automatic client-side dreaming is disabled by default on native Windows, including when saved `/sleeptime` settings enable it. Manual `/dream` and `/reflect` commands remain available. To opt in, set `LETTA_ENABLE_WINDOWS_AUTO_REFLECTION=1` in the environment of the Letta Code process. This does not affect macOS, Linux (including WSL), or server-side dreaming.
 
 See the full list of slash commands in our [documentation](https://docs.letta.com/letta-code/slash-commands).
 
@@ -41,18 +42,30 @@ Install the package via [npm](https://docs.npmjs.com/downloading-and-installing-
 npm install -g @letta-ai/letta-code
 ```
 
+Alternatively, install with [uv](https://docs.astral.sh/uv/) or [pipx](https://pipx.pypa.io/) (Node.js is bundled):
+
+```bash
+uv tool install letta
+# or
+pipx install letta
+```
+
+Requires Python 3.9+. Wheels support glibc Linux 2.28+ (x86-64/ARM64), macOS 14+ (Intel/Apple Silicon), and Windows x64; Alpine/musl, 32-bit systems, and Windows ARM64 are unsupported.
+
+If `npm install -g` fails with `EACCES`, don't use `sudo`: root ownership prevents the CLI's `npm install -g` self-updates. Use uv/pipx, a user-owned npm prefix, or nvm. See the [CLI installation docs](https://docs.letta.com/platform/cli).
+
 Navigate to your project directory and run `letta` (see command-line options [in the docs](https://docs.letta.com/letta-code/commands)). You can also run the tutorial agent with: 
 ```
 letta --new-agent --personality tutorial
 ```
 
-Run `/connect` to configure your own LLM API keys (OpenAI / ChatGPT, Anthropic, Z.ai coding plan, etc.), and use `/model` to swap models.
+Letta Cloud is the default. On first launch, choose to sign in with Letta or proceed locally; your choice is saved for future runs. Run `letta setup` to choose again, or `letta backend cloud` / `letta backend local` to change the default. Use `--backend cloud` or `--backend local` for a one-off override without changing the saved default.
 
-You can also download the [**desktop app**](https://docs.letta.com/letta-code/desktop-app) for macOS, Windows, and Linux. Agents created in the CLI are available via the desktop app, and vice versa.
+Run `/connect` to configure your own LLM API keys (OpenAI / ChatGPT, Anthropic, Z.ai coding plan, etc.), and use `/model` to swap models.
 
 ## Letta Cloud
 
-Agents stored in Letta Cloud keep their memory, identity, and conversations there while the Letta Code harness can run on any connected computer: your laptop, [GitHub Actions](https://github.com/letta-ai/letta-code-action), a managed cloud sandbox, a remote VM, or a Mac Mini. You can chat with the same agents through [chat.letta.com](https://chat.letta.com/) or the desktop app.
+Letta Cloud stores agents' memory, identity, and conversations while Letta Code runs on a laptop, [GitHub Actions](https://github.com/letta-ai/letta-code-action), a Cloud sandbox, or a remote computer. Chat with them through [chat.letta.com](https://chat.letta.com/). On resume, bundled default system prompts (including older versions) become Cloud-managed. Custom prompts stay explicit. Set `LETTA_CODE_PRESERVE_CLOUD_SYSTEM_PROMPT=1` to disable automatic prompt updates on Cloud.
 
 ```mermaid
 graph TD
@@ -63,7 +76,7 @@ graph TD
     LettaCloud --> D["📦 Managed Sandbox"]
 ```
 
-Run `/login` from the CLI or sign in through the desktop app to access agents in your Letta account.
+Run `/login` from the CLI to access agents in your Letta account.
 
 ### Remote computers
 Agents stored in Letta Cloud can run across multiple machines. Connect any machine by running:

@@ -12,7 +12,10 @@ import type { StopReasonType } from "@letta-ai/letta-client/resources/runs/runs"
 import { resolveActingUserId } from "@/agent/acting-user";
 import { loadPreloadedSkills } from "@/agent/preloaded-skills";
 import { shouldLaunchThroughListener } from "@/agent/subagents/subagent-launcher";
+import { INTERRUPTED_BY_USER } from "@/constants";
 import { buildHeadlessSenderReminder } from "@/headless-message-sender";
+import { createHeadlessResponseState } from "@/headless-response-state";
+import { createStartupBackend } from "@/headless-startup-backend";
 import { getTerminalTelemetrySurface, telemetry } from "@/telemetry";
 import {
   trackBoundaryError,
@@ -57,16 +60,11 @@ import {
 } from "./agent/chatgpt-plan-rotation";
 import { setAgentContext, setConversationId } from "./agent/context";
 import { createAgent } from "./agent/create";
+import { prepareExistingHeadlessModel } from "./agent/headless-model-startup";
 import { handleListMessages } from "./agent/list-messages-handler";
 import { getStreamToolContextId, sendMessageStream } from "./agent/message";
-import {
-  getModelPresetUpdateForAgent,
-  getModelUpdateArgs,
-  getResumeRefreshArgs,
-  preservableContextWindow,
-  resolveModel,
-} from "./agent/model";
-import { updateAgentLLMConfig, updateAgentSystemPrompt } from "./agent/modify";
+import { getModelUpdateArgs, resolveModel } from "./agent/model";
+import { updateAgentSystemPrompt } from "./agent/modify";
 import { buildCreateAgentOptionsForPersonality } from "./agent/personality";
 import { resolvePersonalityId } from "./agent/personality-presets";
 import {
@@ -133,6 +131,7 @@ import {
   clearHeadlessClientToolRules,
   createHeadlessEphemeralConversation,
   prepareHeadlessEphemeralBackend,
+  retrieveHeadlessConversation,
 } from "./headless-ephemeral-startup";
 import { launchListenerConversation } from "./headless-listener-launch";
 import { resolveHeadlessMemfsPolicy } from "./headless-memfs-policy";
@@ -177,13 +176,10 @@ import {
   enqueueMemoryGitSyncReminder,
 } from "./reminders/state";
 import { getCurrentWorkingDirectory } from "./runtime-context";
+import { subagentExecutionSettings } from "./runtime-execution-settings";
 import { settingsManager, shouldPersistSessionState } from "./settings-manager";
 import { writeWireMessage, writeWireMessageAsync } from "./stream-json-writer";
-import { stopMonitorsForScope } from "./tools/impl/stop-monitor";
-import {
-  INTERACTIVE_USER_INPUT_TOOL_NAMES,
-  isInteractiveApprovalTool,
-} from "./tools/interactive-policy";
+import { shutdownBackgroundMemoryTasks } from "./tools/impl/memory-task-lifecycle";
 import {
   type ExternalToolDefinition,
   registerExternalTools,
@@ -214,10 +210,8 @@ import {
   reportAllMilestones,
 } from "./utils/timing";
 
-// Maximum number of times to retry a turn when the backend
-// reports an `llm_api_error` stop reason. This helps smooth
-// over transient LLM/backend issues without requiring the
-// caller to manually resubmit the prompt.
+// Max retries for a turn whose backend stop reason is `llm_api_error`:
+// smooths transient LLM/backend issues without caller resubmission.
 const LLM_API_ERROR_MAX_RETRIES = 3;
 
 // Retry config for empty response errors (Opus 4.6 SADs)
@@ -433,7 +427,6 @@ async function prepareHeadlessToolExecutionContext(params: {
     conversationId: params.conversationId,
     overrideModel: params.overrideModel,
     workingDirectory: getCurrentWorkingDirectory(),
-    exclude: [...INTERACTIVE_USER_INPUT_TOOL_NAMES],
     cachedAgent: params.cachedAgent,
     modContext: params.modContext,
     modEvents: params.modEvents,
@@ -805,6 +798,9 @@ export async function handleHeadlessCommand(
     computer: explicitEnvironmentSelector,
     ephemeral: values.ephemeral,
   });
+  if (values["client-message-id"] !== undefined && !usesRemoteEnvironment)
+    throw new Error("--client-message-id requires a Cloud input destination");
+  const startupBackend = createStartupBackend(backend, usesRemoteEnvironment);
 
   // Resolve agent (same logic as interactive mode)
   let agent: AgentState | null = null;
@@ -819,6 +815,8 @@ export async function handleHeadlessCommand(
   let specifiedAgentIdFromAmbient = false;
   const forceNew = values["new-agent"];
   const ephemeralFlag = values.ephemeral;
+  let isDetached = Boolean(ephemeralFlag);
+  let parentAgentId: string | null = null;
   const systemPromptPreset = values.system;
   const systemCustom = values["system-custom"];
   const personalityInput = values.personality;
@@ -831,9 +829,9 @@ export async function handleHeadlessCommand(
   const memfsFlag = values.memfs;
   const statelessFlag = values.stateless;
   const isSubagentRole = process.env.LETTA_CODE_AGENT_ROLE === "subagent";
-  // Fresh subagents are stateless by role. --stateless extends only the
-  // MemFS-less session behavior to an existing --agent/--conversation launch;
-  // it does not change that agent's model, prompt, tools, or sampling config.
+  // Fresh subagents are stateless by role; --stateless only extends that to
+  // an existing --agent/--conversation launch — model, prompt, tools, and
+  // sampling config are unchanged.
   const memfsPolicy = resolveHeadlessMemfsPolicy({
     statelessRequested: Boolean(statelessFlag),
     isSubagentRole,
@@ -848,10 +846,7 @@ export async function handleHeadlessCommand(
     );
     disableLocalBackendMemfsForProcess();
   }
-  // Startup policy for the git-backed memory pull on session init.
-  // "blocking" (default): await the pull before proceeding.
-  // "background": fire the pull async, emit init without waiting.
-  // "skip": skip the pull entirely this session.
+  // MemFS startup: block (default), pull in background, or skip this session.
   const memfsStartupRaw = values["memfs-startup"];
   const memfsStartupPolicy: "blocking" | "background" | "skip" =
     memfsStartupRaw === "background" || memfsStartupRaw === "skip"
@@ -922,13 +917,6 @@ export async function handleHeadlessCommand(
     );
     console.error(
       `Error: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    process.exit(1);
-  }
-
-  if (preLoadSkillsRaw && resolvedSkillSources.length === 0) {
-    console.error(
-      "Error: --pre-load-skills cannot be used when all skill sources are disabled.",
     );
     process.exit(1);
   }
@@ -1077,21 +1065,21 @@ export async function handleHeadlessCommand(
     process.exit(1);
   }
 
-  // Priority 0: --conversation derives agent from conversation ID.
-  // "default" is a virtual agent-scoped conversation (not a retrievable conv-*).
-  // It requires --agent and should not hit conversations.retrieve().
+  // Resolve persisted history; "default" is virtual and requires --agent.
   if (specifiedConversationId && specifiedConversationId !== "default") {
     try {
       debugLog(
         "conversations",
         `retrieve(${specifiedConversationId}) [headless conv→agent lookup]`,
       );
-      const conversation = await backend.retrieveConversation(
+      ({
+        agent,
+        detached: isDetached,
+        parentAgentId,
+      } = await retrieveHeadlessConversation(
+        startupBackend,
         specifiedConversationId,
-      );
-      agent = await backend.retrieveAgent(conversation.agent_id, {
-        include: ["agent.tools", "agent.tags"],
-      });
+      ));
     } catch (error) {
       trackHeadlessBoundaryError(
         "headless_conversation_lookup_failed",
@@ -1106,7 +1094,7 @@ export async function handleHeadlessCommand(
   // Priority 2: Try to use --agent specified ID
   if (!agent && specifiedAgentId) {
     try {
-      agent = await backend.retrieveAgent(specifiedAgentId, {
+      agent = await startupBackend.retrieveAgent(specifiedAgentId, {
         include: ["agent.tools", "agent.tags"],
       });
     } catch (_error) {
@@ -1277,53 +1265,32 @@ export async function handleHeadlessCommand(
     process.exit(1);
   }
   markMilestone("HEADLESS_AGENT_RESOLVED");
-  const publicAgentId = ephemeralFlag ? null : agent.id;
+  const publicAgentId = isDetached ? null : agent.id;
   telemetry.setCurrentAgent(publicAgentId, agent.tags);
-  const isResumingAgent = !ephemeralFlag && !!(specifiedAgentId || !forceNew);
+  const isResumingAgent = !isDetached && !!(specifiedAgentId || !forceNew);
+  let conversationModel: Partial<ConversationCreateBody> | undefined;
   // Refresh presets before applying optional model/system-prompt overrides.
 
   if (isResumingAgent) {
-    if (model) {
-      const modelHandle = resolveModel(model);
-      if (typeof modelHandle !== "string") {
-        console.error(`Error: Invalid model "${model}"`);
-        process.exit(1);
-      }
-
-      // Always apply model update - different model IDs can share the same
-      // handle but have different settings (e.g., gpt-5.2-medium vs gpt-5.2-xhigh)
-      const updateArgs = getModelUpdateArgs(model);
-      agent = await updateAgentLLMConfig(agent.id, modelHandle, updateArgs);
-    } else {
-      const presetRefresh = getModelPresetUpdateForAgent(agent);
-      if (presetRefresh) {
-        const { updateArgs: resumeRefreshUpdateArgs, needsUpdate } =
-          getResumeRefreshArgs(presetRefresh.updateArgs, agent);
-
-        if (needsUpdate) {
-          // Resume refresh must not reset the context window; preserve it by
-          // re-sending the agent's current value explicitly (omitting it
-          // makes the server re-derive + clamp to a legacy 128k default —
-          // LET-9786). A current value that looks like that clamp is not
-          // preserved, letting the agent heal.
-          const preservedContextWindow = preservableContextWindow(
-            agent.llm_config?.context_window,
-            presetRefresh.modelHandle,
-          );
-          agent = await updateAgentLLMConfig(
-            agent.id,
-            presetRefresh.modelHandle,
-            resumeRefreshUpdateArgs,
-            preservedContextWindow !== undefined
-              ? { contextWindowOverride: preservedContextWindow }
-              : undefined,
-          );
-        }
-      }
+    const modelHandle = model ? resolveModel(model) : undefined;
+    if (model && typeof modelHandle !== "string") {
+      console.error(`Error: Invalid model "${model}"`);
+      process.exit(1);
     }
+    const prepared = await prepareExistingHeadlessModel({
+      agent,
+      modelIdentifier: model,
+      modelHandle: modelHandle ?? undefined,
+      createsConversation:
+        !specifiedConversationId &&
+        (forceNewConversation ||
+          process.env.LETTA_CODE_AGENT_ROLE !== "subagent"),
+      localModelCatalog: backend.capabilities.localModelCatalog,
+    });
+    agent = prepared.agent;
+    conversationModel = prepared.conversationModel;
   }
 
-  // Determine which conversation to use
   let conversationId: string;
   let conversationOpenReason: ModConversationOpenReason = "startup";
   let effectiveReflectionSettings: ReflectionSettings;
@@ -1335,6 +1302,7 @@ export async function handleHeadlessCommand(
 
   if (
     !isStatelessSession &&
+    !isDetached &&
     backend.capabilities.remoteMemfs &&
     !autoEnableMemfsForFreshAgent
   ) {
@@ -1353,23 +1321,16 @@ export async function handleHeadlessCommand(
   let memfsBgPromise: Promise<unknown> | undefined;
 
   // Init secrets cache — runs in parallel with memfs sync below.
-  const secretsAgentId = ephemeralFlag ? undefined : agent?.id;
+  const secretsAgentId = isDetached ? undefined : agent?.id;
   const secretsInitPromise = secretsAgentId
     ? import("@/utils/secrets-store").then(({ initSecretsFromServer }) =>
         initSecretsFromServer(secretsAgentId),
       )
     : Promise.resolve();
 
-  // Apply memfs flags and auto-enable from server tag when local settings are missing.
-  // Respects memfsStartupPolicy:
-  //   "blocking"  (default) – await the pull; exit on conflict.
-  //   "background"           – fire pull async; session init proceeds immediately.
-  //   "skip"                 – skip the pull this session.
-  if (isStatelessSession) {
-    // This is a session launch policy: do not hydrate tags, auto-enable,
-    // clone, or pull MemFS. Recording false also keeps downstream client tools,
-    // skills, reflection, and init metadata aligned without mutating the
-    // server-side agent configuration.
+  // Apply MemFS startup policy only to agent-backed sessions.
+  if (isStatelessSession || isDetached) {
+    // Stateless subagents retain the inherited checkout without enabling their own MemFS.
     settingsManager.setMemfsEnabled(agent.id, false);
   } else if (!backend.capabilities.remoteMemfs) {
     if (backend.capabilities.localMemfs) {
@@ -1478,9 +1439,7 @@ export async function handleHeadlessCommand(
     agent = result.agent;
   }
 
-  // Maintain managed system prompt versions without blocking startup.
-  // This updates only agents whose current prompt still matches the stored
-  // managed prompt hash, so custom edits are preserved.
+  // Refresh unchanged managed prompts on resume without blocking startup.
   if (isResumingAgent && !systemPromptPreset) {
     const {
       ensureLettaCodeOriginTag,
@@ -1504,12 +1463,12 @@ export async function handleHeadlessCommand(
     });
   }
 
-  if (!ephemeralFlag) {
+  if (!isDetached) {
     clearHeadlessClientToolRules(agent);
   }
 
   try {
-    if (ephemeralFlag) {
+    if (isDetached) {
       effectiveReflectionSettings = { trigger: "off", stepCount: 0 };
     } else {
       const resolvedReflectionSettings = await applyHeadlessReflectionOverrides(
@@ -1543,7 +1502,7 @@ export async function handleHeadlessCommand(
           "conversations",
           `retrieve(${specifiedConversationId}) [headless --conv validate]`,
         );
-        await backend.retrieveConversation(specifiedConversationId);
+        await startupBackend.retrieveConversation(specifiedConversationId);
         conversationId = specifiedConversationId;
         conversationOpenReason = "resume";
       } catch {
@@ -1554,20 +1513,20 @@ export async function handleHeadlessCommand(
       }
     }
   } else if (forceNewConversation) {
-    // --new flag: create a new conversation (for concurrent sessions).
-    // When --from-agent is set (agent-to-agent messaging), mark the new
-    // conversation as hidden so it doesn't clutter the target agent's
-    // default conversation list in the ADE. The `hidden` field is still
-    // missing from @letta-ai/letta-client@1.10.1 types, but the core
-    // endpoint accepts it and the SDK's create impl forwards unknown
-    // body fields unchanged — remove the cast once the SDK is bumped.
+    // --new creates a conversation for concurrent sessions. With
+    // --from-agent (agent-to-agent messaging), mark it hidden so it
+    // doesn't clutter the target agent's conversation list. `hidden` is
+    // missing from @letta-ai/letta-client@1.10.1 types; the core endpoint
+    // accepts it and the SDK forwards unknown body fields — drop the cast
+    // once the SDK is bumped.
     const createParams: ConversationCreateBody = {
       agent_id: agent.id,
+      ...conversationModel,
     };
     if (fromAgentId) {
       (createParams as { hidden?: boolean }).hidden = true;
     }
-    const conversation = await backend.createConversation(createParams);
+    const conversation = await startupBackend.createConversation(createParams);
     conversationId = conversation.id;
     conversationOpenReason = "new";
   } else if (isSubagent) {
@@ -1576,12 +1535,12 @@ export async function handleHeadlessCommand(
     conversationId = "default";
     conversationOpenReason = "startup";
   } else {
-    // Default for headless: always create a new conversation to avoid
-    // 409 "conversation busy" races (e.g., parent agent calling letta -p).
-    // Use --conv default to explicitly target the agent's
-    // primary conversation.
-    const conversation = await backend.createConversation({
+    // Headless default: new conversation, avoiding 409 "conversation busy"
+    // races (e.g., a parent agent calling letta -p). Use --conv default to
+    // target the agent's primary conversation explicitly.
+    const conversation = await startupBackend.createConversation({
       agent_id: agent.id,
+      ...conversationModel,
     });
     conversationId = conversation.id;
     conversationOpenReason = "new";
@@ -1591,9 +1550,8 @@ export async function handleHeadlessCommand(
   // Set conversation ID in context for tools (e.g., Skill tool) to access
   setConversationId(conversationId);
 
-  // Save session (agent + conversation) to both project and global settings
-  // Skip for subagents - they shouldn't pollute the LRU settings
-  if (!ephemeralFlag && shouldPersistSessionState()) {
+  // Only foreground agent sessions belong in the project/global LRU.
+  if (!isDetached && shouldPersistSessionState()) {
     await settingsManager.loadLocalProjectSettings();
     settingsManager.persistSession(agent.id, conversationId);
   }
@@ -1675,10 +1633,7 @@ export async function handleHeadlessCommand(
     agent.tools?.map((t) => t.name).filter((n): n is string => !!n) || [];
   // Cache the initial agent to avoid repeated retrievals in the turn loop.
   let cachedAgent: AgentState | null = null;
-  // Capture the resolved model (conversation override → agent fallback) so
-  // subsequent while-loop iterations can prepare the correct toolset without
-  // re-fetching the conversation model. This is only for local tool context;
-  // request-scoped override_model should remain reserved for provider fallback.
+  // Cache the resolved toolset model; reserve request override_model for fallback.
   let preparedEffectiveModel: string | null | undefined;
   {
     const initialToolContext = await prepareHeadlessToolExecutionContext({
@@ -1693,12 +1648,17 @@ export async function handleHeadlessCommand(
     preparedEffectiveModel =
       initialToolContext.preparedToolContext.effectiveModel;
   }
+  const reportModel =
+    conversationModel?.model ??
+    preparedEffectiveModel ??
+    agent.llm_config?.model;
 
   // If input-format is stream-json, use bidirectional mode
   if (isBidirectionalMode) {
     await runBidirectionalMode(
       agent,
       conversationId,
+      reportModel,
       outputFormat,
       includePartialMessages,
       availableTools,
@@ -1710,12 +1670,10 @@ export async function handleHeadlessCommand(
     return;
   }
 
-  // Create buffers to accumulate stream (pass agent.id for server-side tool hooks)
   const buffers = createBuffers(agent.id);
 
   telemetry.setSessionStatsGetter(() => sessionStats.getSnapshot());
 
-  // Use agent.id as session_id for all stream-json messages
   const sessionId = agent.id;
   let headlessConversationClosed = false;
   let lastKnownRunId: string | null = null;
@@ -1750,6 +1708,7 @@ export async function handleHeadlessCommand(
       await telemetry.flush();
     } finally {
       headlessModAdapter.dispose();
+      await shutdownBackgroundMemoryTasks(code);
       telemetry.setSessionStatsGetter(undefined);
     }
     return await flushAndExit(code);
@@ -1763,7 +1722,7 @@ export async function handleHeadlessCommand(
       session_id: sessionId,
       agent_id: publicAgentId,
       conversation_id: conversationId,
-      model: agent.llm_config?.model ?? "",
+      model: reportModel ?? "",
       tools: availableTools,
       cwd: getCurrentWorkingDirectory(),
       mcp_servers: [],
@@ -1790,7 +1749,7 @@ export async function handleHeadlessCommand(
     const { getResumeDataFromBackend } = await import("@/agent/check-approval");
     while (true) {
       // Detached conversations have no server-side agent to retrieve.
-      const freshAgent = ephemeralFlag
+      const freshAgent = isDetached
         ? agent
         : await backend.retrieveAgent(agent.id);
 
@@ -1890,15 +1849,17 @@ export async function handleHeadlessCommand(
     }
   };
 
-  // Clear any pending approvals before starting a new turn - ONLY when resuming (LET-7101)
-  // For new agents/conversations, lazy recovery handles any edge cases
-  if (isResumingAgent) {
+  // Recover resumed standalone turns here; listeners own their own recovery.
+  if (
+    isResumingAgent ||
+    (!usesRemoteEnvironment && isDetached && !ephemeralFlag)
+  ) {
     try {
       await resolveAllPendingApprovals("queue_for_next_turn");
     } catch (approvalError) {
-      // Don't crash on pre-loop approval resolution (e.g., 409 from server-side
-      // sleeptime run holding the conversation lock). The main loop's own
-      // approval-recovery and conversation-busy retry logic will handle it.
+      // Don't crash on pre-loop approval resolution (e.g., 409 from a
+      // server-side sleeptime run holding the lock): the main loop's own
+      // approval-recovery and busy-retry logic handles it.
       if (outputFormat === "stream-json") {
         const errorMsg: ErrorMessage = {
           type: "error",
@@ -1917,7 +1878,6 @@ export async function handleHeadlessCommand(
     }
   }
 
-  // Build message content with reminders
   const contentParts: MessageCreate["content"] = [];
   const pushPart = (text: string) => {
     if (!text) return;
@@ -1971,21 +1931,21 @@ export async function handleHeadlessCommand(
     );
   }
 
-  // Add user prompt
   pushPart(prompt);
 
-  telemetry.trackUserInput(
-    prompt,
-    "user",
-    agent.llm_config?.model ?? "unknown",
-  );
+  telemetry.trackUserInput(prompt, "user", reportModel ?? "unknown");
 
   if (usesRemoteEnvironment) {
+    const agentId = publicAgentId ?? parentAgentId;
+    if (!agentId)
+      throw new Error(
+        "Listener delivery requires a conversation with an agent or parent agent.",
+      );
     const environmentSelector = explicitEnvironmentSelector ?? "";
     const useCloudSandbox = isCloudEnvironmentSelector(environmentSelector);
     const environmentRouting = environmentSelector
       ? useCloudSandbox
-        ? await resolveAgentSandboxConnectionId(agent.id, { conversationId })
+        ? await resolveAgentSandboxConnectionId(agentId, { conversationId })
         : await resolveEnvironmentConnectionId(environmentSelector)
       : null;
     const connectionId =
@@ -2001,10 +1961,12 @@ export async function handleHeadlessCommand(
         })
       : { source: "same-environment" };
     const launchParams: Parameters<typeof launchListenerConversation>[0] = {
-      noWait: Boolean(values["no-wait"]),
+      noWait: isAgentLaunch || Boolean(values["no-wait"]),
+      clientMessageId: values["client-message-id"],
       connectionId,
+      parentAgentId: parentAgentId ?? undefined,
       scope: {
-        agent_id: agent.id,
+        agent_id: publicAgentId,
         conversation_id: conversationId,
         acting_user_id: resolveActingUserId(),
       },
@@ -2046,10 +2008,7 @@ export async function handleHeadlessCommand(
         disable_memory_guard: cliPermissions.isMemoryGuardDisabled(),
         max_turns: maxTurns,
         preload_skills: parseCsvListFlag(preLoadSkillsRaw),
-        parent_agent_id: process.env.LETTA_PARENT_AGENT_ID,
-        ...(process.env.LETTA_CODE_AGENT_ROLE === "subagent"
-          ? { agent_role: "subagent" as const }
-          : {}),
+        ...subagentExecutionSettings(process.env),
         ...(!environmentSelector
           ? {
               transcript_path: process.env.TRANSCRIPT_PATH,
@@ -2110,7 +2069,7 @@ export async function handleHeadlessCommand(
     );
   }
 
-  // Start with the user message
+  const responseState = createHeadlessResponseState();
   let currentInput: Array<MessageCreate | ApprovalCreate> = [
     {
       role: "user",
@@ -2188,11 +2147,6 @@ export async function handleHeadlessCommand(
 
   // One-shot mode has no input loop, so wire SIGINT directly into the turn.
   const sigintSignal = createSigintAbortSignal();
-  sigintSignal.addEventListener(
-    "abort",
-    () => stopMonitorsForScope({ agentId: agent.id, conversationId }),
-    { once: true },
-  );
   const exitInterrupted = async (): Promise<never> => {
     if (outputFormat === "stream-json") {
       const errorMsg: ErrorMessage = {
@@ -2219,10 +2173,9 @@ export async function handleHeadlessCommand(
         (item) => item.type === "approval",
       );
 
-      // Check max turns limit before starting a new user turn.
-      // Do NOT enforce before approval continuations: otherwise we can exit
-      // with max_steps while the backend is still waiting for the approval
-      // response, leaving the run stuck in requires_approval.
+      // Check max turns before a new user turn — but not before approval
+      // continuations, or we can exit with max_steps while the backend is
+      // still waiting on the approval response (stuck requires_approval).
       if (!hasApprovalContinuation) {
         await checkMaxTurns();
       }
@@ -2272,6 +2225,7 @@ export async function handleHeadlessCommand(
           currentInput,
           {
             agentId: agent.id,
+            allowResponseStateReuse: responseState.consume(currentInput),
             preparedToolContext:
               turnToolContext.preparedToolContext.preparedToolContext,
           },
@@ -2301,8 +2255,7 @@ export async function handleHeadlessCommand(
         );
 
         // Check for pending approval blocking new messages - resolve and retry.
-        // This is distinct from "conversation busy" and needs approval resolution,
-        // not just a timed delay.
+        // Distinct from "conversation busy": needs approval resolution, not delay.
         if (preStreamAction === "resolve_approval_pending") {
           if (outputFormat === "stream-json") {
             const recoveryMsg: RecoveryMessage = {
@@ -2324,10 +2277,9 @@ export async function handleHeadlessCommand(
           continue;
         }
 
-        // Check for 409 "conversation busy" - resume via conversation stream endpoint.
-        // Server resolves: (1) otid lookup, (2) active run fallback.
-        // OTID lookup provides server-side request ownership validation.
-        // Falls back to exponential backoff retry if the endpoint fails.
+        // 409 "conversation busy": resume via the conversation stream
+        // endpoint. Server resolves otid lookup then active-run fallback;
+        // falls back to exponential backoff retry if the endpoint fails.
         if (preStreamAction === "retry_conversation_busy") {
           const messageOtid = currentInput
             .map((item) => (item as Record<string, unknown>).otid)
@@ -2476,10 +2428,9 @@ export async function handleHeadlessCommand(
             return { stopReason: "error", shouldAccumulate: true };
           }
 
-          // Approval-flow chunks are omitted from stream-json so the stream
-          // matches other coding agents (Claude Code / Codex): the canonical
-          // tool_call_message emitted post-drain is the single call event, and
-          // approvals are handled out-of-band. See emitLocalToolCalls.
+          // Approval-flow chunks are omitted from stream-json to match other
+          // coding agents: the post-drain tool_call_message is the single call
+          // event; approvals are out-of-band. See emitLocalToolCalls.
           const messageType = (chunk as { message_type?: string }).message_type;
           if (
             messageType === "approval_request_message" ||
@@ -2566,8 +2517,8 @@ export async function handleHeadlessCommand(
         chatgptExhaustedProviders.clear();
 
         // Emit turn_end. A mod may return { continue: "..." } to append a
-        // follow-up user message and run another turn. Auto-continues re-enter
-        // the loop and count against --max-turns via checkMaxTurns at the top.
+        // follow-up user message; auto-continues re-enter the loop and count
+        // against --max-turns via checkMaxTurns at the top.
         const continueMessage = await emitHeadlessTurnEnd({
           agent,
           conversationId,
@@ -2639,7 +2590,6 @@ export async function handleHeadlessCommand(
 
         const { autoAllowed, autoDenied, needsUserInput } =
           await classifyApprovals(approvals, {
-            alwaysRequiresUserInput: isInteractiveApprovalTool,
             requireArgsForAutoApprove: true,
             missingNameReason: "Tool call incomplete - missing name",
             toolContextId: turnToolContextId ?? undefined,
@@ -2671,9 +2621,9 @@ export async function handleHeadlessCommand(
           "@/agent/approval-execution"
         );
 
-        // Local tools execute client-side, so their calls + returns never reach
-        // the server stream. Surface them on the wire so stream-json consumers get
-        // the same tool_call_message → tool_return_message pairing as server tools.
+        // Local tools execute client-side; surface their calls + returns on
+        // the wire so stream-json consumers see the same tool_call_message →
+        // tool_return_message pairing as server tools.
         if (outputFormat === "stream-json") {
           emitLocalToolCalls(decisions, sessionId);
         }
@@ -2696,13 +2646,10 @@ export async function handleHeadlessCommand(
           emitLocalToolReturns(executedResults, sessionId);
         }
 
-        // Send all results in one batch
-        const approvalInputWithOtid = {
-          type: "approval" as const,
-          approvals: executedResults as ApprovalResult[],
-          otid: randomUUID(),
-        };
-        currentInput = [approvalInputWithOtid];
+        currentInput = responseState.prepare(
+          executedResults,
+          needsUserInput.length === 0,
+        );
         continue;
       }
 
@@ -2845,10 +2792,9 @@ export async function handleHeadlessCommand(
         }
       }
 
-      // Unexpected stop reason (error, llm_api_error, etc.)
-      // Before failing, check run metadata to see if this is a retriable error
-      // This handles cases where the backend sends a generic error stop_reason but the
-      // underlying cause is a transient LLM/network issue that should be retried
+      // Unexpected stop reason: before failing, check run metadata for a
+      // retriable cause — the backend may send a generic error stop_reason
+      // for a transient LLM/network issue.
 
       // Early exit for stop reasons that should never be retried
       const nonRetriableReasons: StopReasonType[] = [
@@ -2893,9 +2839,8 @@ export async function handleHeadlessCommand(
               metaError?.retryable ?? metaError?.error?.retryable;
           }
 
-          // Special handling for empty response errors (Opus 4.6 SADs)
-          // Empty LLM response retry (e.g. Opus 4.6 occasionally returns no content).
-          // Retry 1: same input unchanged. Retry 2: append system reminder nudging the model.
+          // Empty LLM response retry (Opus 4.6 SADs): retry 1 sends the same
+          // input; retry 2 appends a system reminder nudging the model.
           if (
             isEmptyResponseRetryable(
               errorType,
@@ -3107,6 +3052,10 @@ export async function handleHeadlessCommand(
       await exitHeadless(1, "headless_stop_reason_error");
     }
   } catch (error) {
+    // Grace-expiry straggler abort: classify as SIGINT, not an error.
+    if (sigintSignal.aborted) {
+      await exitInterrupted();
+    }
     // Mark incomplete tool calls as cancelled
     markIncompleteToolsAsCancelled(buffers, true, "stream_error");
 
@@ -3135,6 +3084,7 @@ export async function handleHeadlessCommand(
   }
 
   await runPostTurnMemorySync({
+    conversationId,
     agentId: agent.id,
     isEnabled: (id) => settingsManager.isMemfsEnabled(id),
     debugLabel: "Post-turn headless memory sync",
@@ -3188,7 +3138,7 @@ export async function handleHeadlessCommand(
   if (!lastAssistant && (lastReasoning || lastToolResult)) {
     trackEndTurnNoAssistant({
       fallbackKind: lastReasoning ? "reasoning" : "tool_call",
-      modelHandle: agent.llm_config?.model ?? model,
+      modelHandle: reportModel ?? model,
       runId: lastKnownRunId ?? undefined,
       isSubagent,
       subagentType:
@@ -3294,6 +3244,7 @@ export async function handleHeadlessCommand(
 async function runBidirectionalMode(
   agent: AgentState,
   conversationId: string,
+  effectiveModel: string | null | undefined,
   _outputFormat: string,
   includePartialMessages: boolean,
   availableTools: string[],
@@ -3304,7 +3255,8 @@ async function runBidirectionalMode(
 ): Promise<void> {
   const sessionId = agent.id;
   const backend = getBackend();
-  const telemetryModelId = agent.llm_config?.model ?? "unknown";
+  const telemetryModelId =
+    effectiveModel ?? agent.llm_config?.model ?? "unknown";
   const readline = await import("node:readline");
   const systemPromptRecompileByConversation = new Map<string, Promise<void>>();
   const queuedSystemPromptRecompileByConversation = new Set<string>();
@@ -3336,6 +3288,7 @@ async function runBidirectionalMode(
       await telemetry.flush();
     } finally {
       headlessModAdapter.dispose();
+      await shutdownBackgroundMemoryTasks(code);
     }
     return await flushAndExit(code);
   };
@@ -3347,7 +3300,7 @@ async function runBidirectionalMode(
     session_id: sessionId,
     agent_id: agent.id,
     conversation_id: conversationId,
-    model: agent.llm_config?.model ?? "",
+    model: effectiveModel ?? agent.llm_config?.model ?? "",
     tools: availableTools,
     cwd: getCurrentWorkingDirectory(),
     mcp_servers: [],
@@ -3364,11 +3317,9 @@ async function runBidirectionalMode(
 
   // Track current operation for interrupt support
   let currentAbortController: AbortController | null = null;
-  // Latch: an interrupt may arrive on stdin between the user message and
-  // when the abort controller for that turn is created (the gap is small but
-  // real — readline fires the next line before the main loop's microtask
-  // creating the controller runs). When that happens, set this flag so the
-  // turn aborts immediately after creation.
+  // Latch: an interrupt can arrive on stdin between the user message and
+  // creation of that turn's abort controller (readline fires the next line
+  // before the loop's microtask runs). Flag it so the turn aborts on creation.
   let pendingInterrupt = false;
   // True only in the narrow window between a user message being handed to the
   // main loop and its AbortController being created. Gates `pendingInterrupt`
@@ -3496,18 +3447,16 @@ async function runBidirectionalMode(
   let lineResolver: ((line: string | null) => void) | null = null;
 
   // ── Queue lifecycle tracking (stream-json only) ────────────────
-  // Bidirectional mode always runs under stream-json input format, so queue
-  // events are always emitted here. emitQueueEvent is a no-op guard retained
-  // for clarity and future-proofing against non-stream-json callers.
+  // Bidirectional mode is always stream-json, so queue events always emit
+  // here; emitQueueEvent is a no-op guard for non-stream-json callers.
   const emitQueueEvent = (e: QueueLifecycleEvent): void => {
     writeWireMessage(e);
   };
 
   let turnInProgress = false;
-  // Set when a turn ends interrupted (aborted mid-flight). A cancel during a
-  // tool's approval gate leaves the agent in `requires_approval` with a
-  // dangling approval; the next user turn must clear it before sending or the
-  // run errors on stale state (surfaces downstream as a bare "refusal").
+  // Set when a turn ends interrupted (aborted mid-flight). A cancel during
+  // a tool's approval gate leaves `requires_approval` dangling; the next
+  // user turn must clear it or the run errors (bare "refusal").
   let priorTurnInterrupted = false;
 
   const msgQueueRuntime = new QueueRuntime({
@@ -3694,8 +3643,8 @@ async function runBidirectionalMode(
     }
     if (lineResolver) {
       // Handing a user message to a waiting main loop opens the pre-controller
-      // race window: mark turnStarting so an interrupt arriving in the same
-      // stdin burst (before the controller exists) latches via "latch" above.
+      // race window: turnStarting makes an interrupt in the same stdin burst
+      // latch via "latch" above (before the controller exists).
       if (parsedLine?.type === "user") turnStarting = true;
       const resolve = lineResolver;
       lineResolver = null;
@@ -3722,6 +3671,41 @@ async function runBidirectionalMode(
     }
     return new Promise<string | null>((resolve) => {
       lineResolver = resolve;
+    });
+  }
+
+  /** Sentinel: an external-tool wait unwound because the turn was cancelled. */
+  const EXTERNAL_TOOL_WAIT_ABORTED = Symbol("externalToolWaitAborted");
+  type ExternalToolWaitOutcome =
+    | string
+    | null
+    | typeof EXTERNAL_TOOL_WAIT_ABORTED;
+
+  // Wait for the next stdin line, but settle early when the turn's abort
+  // signal fires. On abort the pending line resolver is consumed so later
+  // stdin lines land in lineQueue for the main loop instead of resolving an
+  // orphaned waiter (which would silently drop them).
+  async function getNextLineOrAbort(
+    signal: AbortSignal | undefined,
+  ): Promise<ExternalToolWaitOutcome> {
+    if (signal?.aborted) return EXTERNAL_TOOL_WAIT_ABORTED;
+    if (lineQueue.length > 0) return lineQueue.shift() ?? null;
+    if (!signal) return getNextLine();
+    return new Promise<ExternalToolWaitOutcome>((resolve) => {
+      const cleanup = () => signal.removeEventListener("abort", onAbort);
+      const onAbort = () => {
+        cleanup();
+        // Consume the pending resolver so lines arriving after this wait
+        // unwinds queue for the main loop rather than resolving an orphan.
+        if (lineResolver === settle) lineResolver = null;
+        resolve(EXTERNAL_TOOL_WAIT_ABORTED);
+      };
+      const settle = (line: string | null) => {
+        cleanup();
+        resolve(line);
+      };
+      signal.addEventListener("abort", onAbort);
+      lineResolver = settle;
     });
   }
 
@@ -3918,7 +3902,7 @@ async function runBidirectionalMode(
             request_id: requestId ?? "",
             response: {
               agent_id: agent.id,
-              model: agent.llm_config?.model,
+              model: effectiveModel ?? agent.llm_config?.model,
               tools: availableTools,
               memfs_enabled: settingsManager.isMemfsEnabled(agent.id),
               skill_sources: skillSources,
@@ -3962,48 +3946,91 @@ async function runBidirectionalMode(
         registerExternalTools(tools);
 
         // Set up the external tool executor to send requests back to SDK
-        setExternalToolExecutor(async (toolCallId, toolName, input) => {
-          // Send execute_external_tool request to SDK
-          const execRequest: ControlRequest = {
-            type: "control_request",
-            request_id: `ext-${toolCallId}`,
-            request: {
-              subtype: "execute_external_tool",
-              tool_call_id: toolCallId,
-              tool_name: toolName,
-              input,
-            } as unknown as CanUseToolControlRequest, // Type cast for compatibility
-          };
-          writeWireMessage(execRequest);
-
-          // Wait for external_tool_result response
-          while (true) {
-            const line = await getNextLine();
-            if (line === null) {
+        setExternalToolExecutor(
+          async (toolCallId, toolName, input, context) => {
+            const signal = context?.signal;
+            // A cancelled turn must not start new remote work.
+            if (signal?.aborted) {
               return {
-                content: [{ type: "text", text: "stdin closed" }],
+                content: [{ type: "text", text: INTERRUPTED_BY_USER }],
                 isError: true,
               };
             }
-            if (!line.trim()) continue;
+            // Send execute_external_tool request to SDK
+            const execRequest: ControlRequest = {
+              type: "control_request",
+              request_id: `ext-${toolCallId}`,
+              request: {
+                subtype: "execute_external_tool",
+                tool_call_id: toolCallId,
+                tool_name: toolName,
+                input,
+              } as unknown as CanUseToolControlRequest, // Type cast for compatibility
+            };
+            writeWireMessage(execRequest);
 
+            // Wait for external_tool_result response. Lines that arrive while
+            // the remote tool runs are deferred back to lineQueue (permission-
+            // wait parity) so queued user input and control requests are not
+            // dropped; stale external_tool_result responses for other calls
+            // stay dropped. The turn's abort signal unwinds the wait so a
+            // cancel does not block on the remote tool.
+            const deferredLines: string[] = [];
             try {
-              const msg = JSON.parse(line);
-              if (
-                msg.type === "control_response" &&
-                msg.response?.subtype === "external_tool_result" &&
-                msg.response?.tool_call_id === toolCallId
-              ) {
-                return {
-                  content: msg.response.content ?? [{ type: "text", text: "" }],
-                  isError: msg.response.is_error ?? false,
-                };
+              while (true) {
+                const line = await getNextLineOrAbort(signal);
+                if (line === EXTERNAL_TOOL_WAIT_ABORTED) {
+                  return {
+                    content: [{ type: "text", text: INTERRUPTED_BY_USER }],
+                    isError: true,
+                  };
+                }
+                if (line === null) {
+                  // The interrupt fast path wakes a blocked waiter with null; an
+                  // aborted controller distinguishes a user interrupt from stdin
+                  // actually closing.
+                  return {
+                    content: [
+                      {
+                        type: "text",
+                        text: currentAbortController?.signal.aborted
+                          ? INTERRUPTED_BY_USER
+                          : "stdin closed",
+                      },
+                    ],
+                    isError: true,
+                  };
+                }
+                if (!line.trim()) continue;
+
+                try {
+                  const msg = JSON.parse(line);
+                  if (
+                    msg.type === "control_response" &&
+                    msg.response?.subtype === "external_tool_result"
+                  ) {
+                    if (msg.response.tool_call_id === toolCallId) {
+                      return {
+                        content: msg.response.content ?? [
+                          { type: "text", text: "" },
+                        ],
+                        isError: msg.response.is_error ?? false,
+                      };
+                    }
+                    // Stale result for another call: keep dropping it.
+                    continue;
+                  }
+                } catch {
+                  // Unparseable lines are deferred; the main loop surfaces the
+                  // parse error just as it would have without the tool call.
+                }
+                deferredLines.push(line);
               }
-            } catch {
-              // Ignore parse errors, keep waiting
+            } finally {
+              if (deferredLines.length > 0) lineQueue.unshift(...deferredLines);
             }
-          }
-        });
+          },
+        );
 
         const registerResponse: ControlResponse = {
           type: "control_response",
@@ -4051,7 +4078,7 @@ async function runBidirectionalMode(
           sessionContext: {
             agentId: agent.id,
             conversationId,
-            model: agent.llm_config?.model,
+            model: effectiveModel ?? agent.llm_config?.model,
             tools: availableTools,
             memfsEnabled: settingsManager.isMemfsEnabled(agent.id),
             sessionId,
@@ -4185,9 +4212,9 @@ async function runBidirectionalMode(
       }
 
       // Enqueue consumed items into msgQueueRuntime for lifecycle tracking.
-      // Done here (not at arrival) to avoid orphaned items from the external-
-      // tool wait loop, which consumes non-matching lines via getNextLine()
-      // without deferring them back to lineQueue.
+      // Done here (not at arrival): the external-tool wait loop defers
+      // non-matching lines back to lineQueue, so items are consumed exactly
+      // once, here, when the coalescing loop yields them.
       for (const input of queuedInputs) {
         enqueueForTracking(input);
       }
@@ -4205,13 +4232,8 @@ async function runBidirectionalMode(
         continue;
       }
 
-      // Drain pre-controller interrupts after installing scoped monitor cleanup.
+      // Drain any interrupt that arrived before the controller existed.
       currentAbortController = new AbortController();
-      currentAbortController.signal.addEventListener(
-        "abort",
-        () => stopMonitorsForScope({ agentId: agent.id, conversationId }),
-        { once: true },
-      );
       if (pendingInterrupt) {
         pendingInterrupt = false;
         currentAbortController.abort();
@@ -4265,7 +4287,7 @@ async function runBidirectionalMode(
           ...sharedReminderParts,
         ]);
 
-        // Initial input is the user message
+        const responseState = createHeadlessResponseState();
         let currentInput: Array<MessageCreate | ApprovalCreate> = [
           { role: "user", content: enrichedContent, otid: userOtid },
         ];
@@ -4356,6 +4378,7 @@ async function runBidirectionalMode(
             availableTools = turnToolContext.availableTools;
             stream = await sendMessageStream(conversationId, currentInput, {
               agentId: agent.id,
+              allowResponseStateReuse: responseState.consume(currentInput),
               preparedToolContext:
                 turnToolContext.preparedToolContext.preparedToolContext,
             });
@@ -4552,7 +4575,6 @@ async function runBidirectionalMode(
 
             const { autoAllowed, autoDenied, needsUserInput } =
               await classifyApprovals(approvals, {
-                alwaysRequiresUserInput: isInteractiveApprovalTool,
                 requireArgsForAutoApprove: true,
                 missingNameReason: "Tool call incomplete - missing name",
                 toolContextId: turnToolContextId ?? undefined,
@@ -4587,8 +4609,7 @@ async function runBidirectionalMode(
               }
 
               if (permResponse.decision === "allow") {
-                // If provided updatedInput (e.g., for AskUserQuestion with answers),
-                // update the approval's toolArgs to use it
+                // Apply tool arguments edited by the permission response.
                 const finalApproval = permResponse.updatedInput
                   ? {
                       ...ac.approval,
@@ -4619,26 +4640,31 @@ async function runBidirectionalMode(
             // executed tool calls + returns (see one-shot path above).
             emitLocalToolCalls(decisions, sessionId);
 
-            const executedResults = await executeApprovalBatch(
-              decisions,
-              undefined,
-              {
-                toolContextId: turnToolContextId ?? undefined,
-                abortSignal: currentAbortController.signal,
-              },
-            );
+            let executedResults: ApprovalResult[];
+            try {
+              executedResults = await executeApprovalBatch(
+                decisions,
+                undefined,
+                {
+                  toolContextId: turnToolContextId ?? undefined,
+                  abortSignal: currentAbortController.signal,
+                },
+              );
+            } catch (error) {
+              // Grace-expiry abort: fall through to the interrupted result
+              // path rather than rendering a stop_reason error.
+              if (currentAbortController?.signal.aborted) {
+                break;
+              }
+              throw error;
+            }
 
             emitLocalToolReturns(executedResults, sessionId);
 
-            // Send approval results back to continue
-            const approvalInputWithOtid = {
-              type: "approval" as const,
-              approvals: executedResults,
-              otid: randomUUID(),
-            };
-            currentInput = [approvalInputWithOtid as unknown as MessageCreate];
-
-            // Continue the loop to process the next stream
+            currentInput = responseState.prepare(
+              executedResults,
+              needsUserInput.length === 0,
+            );
             continue;
           }
 
@@ -4787,6 +4813,7 @@ async function runBidirectionalMode(
         writeWireMessage(errorResultMsg);
       } finally {
         await runPostTurnMemorySync({
+          conversationId,
           agentId: agent.id,
           isEnabled: (id) => settingsManager.isMemfsEnabled(id),
           debugLabel: "Post-turn headless memory sync",

@@ -6,6 +6,8 @@
 // lower-level backend/runtime/shell helpers and shared subagent types, never
 // back on the subagent manager, so the graph stays acyclic.
 
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { ACTING_USER_ID_ENV } from "@/agent/acting-user";
 import { type BackendMode, getLocalBackendStorageDir } from "@/backend";
 import { getLocalBackendMemoryFilesystemRoot } from "@/backend/local/paths";
@@ -14,17 +16,25 @@ import {
   PROVIDERS_ONLY_MOD_CAPABILITY_PROFILE,
 } from "@/mods/capabilities";
 import { getCurrentWorkingDirectory } from "@/runtime-context";
+import { trackBoundaryError } from "@/telemetry/error-reporting";
 import {
   resolveEntryScriptPath,
   resolveLettaInvocation,
 } from "@/tools/impl/shell-env";
+import {
+  readSubagentDepth,
+  SUBAGENT_DEPTH_ENV,
+} from "@/utils/subagent-depth-env";
 import {
   LISTENER_CONNECTION_ENV,
   SUBAGENT_LAUNCH_ENV,
   SUBAGENT_LAUNCH_PROFILE_ENV,
   SUBAGENT_NAME_ENV,
 } from "@/utils/subagent-launch-marker";
+import { TRANSCRIPT_ROOT_ENV } from "@/utils/transcript-paths";
+import { getActiveRuntime } from "@/websocket/listener/runtime";
 import type { SubagentLaunchProfile, SubagentMemoryScope } from ".";
+import { MEMORY_WORKER_SESSION_ENV } from "./memory-worker-session";
 
 interface ResolveSubagentLauncherOptions {
   env?: NodeJS.ProcessEnv;
@@ -164,6 +174,27 @@ export interface ComposeSubagentChildEnvOptions {
   transcriptPath?: string | null;
   /** Name reserved in the parent process, only for a newly created agent. */
   subagentName?: string;
+  /** Parent-process task ID used to isolate child background output files. */
+  subagentId?: string;
+}
+
+function resolveMemorySubagentScratchpad(
+  parentProcessEnv: NodeJS.ProcessEnv,
+  subagentId?: string,
+): string {
+  const configuredScratchpad = parentProcessEnv.LETTA_SCRATCHPAD;
+  if (configuredScratchpad?.trim()) {
+    return configuredScratchpad;
+  }
+
+  const configuredTranscriptRoot = parentProcessEnv[TRANSCRIPT_ROOT_ENV];
+  const transcriptRoot =
+    configuredTranscriptRoot?.trim() ||
+    join(parentProcessEnv.HOME?.trim() || homedir(), ".letta", "transcripts");
+  const scope = subagentId
+    ? encodeURIComponent(subagentId)
+    : crypto.randomUUID();
+  return join(transcriptRoot, "background", scope);
 }
 
 /**
@@ -178,7 +209,7 @@ export interface ComposeSubagentChildEnvOptions {
  *   - MEMORY_DIR / LETTA_MEMORY_DIR are only overridden when the subagent
  *     declares the memory-subagent launch profile. Those subagents operate on
  *     the parent's memory as their working filesystem (reflection, memory,
- *     init, history-analyzer). Other subagents keep whatever MEMORY_DIR they
+ *     init). Other subagents keep whatever MEMORY_DIR they
  *     inherited from the parent process (usually unset).
  *
  * Pure function, no side effects — straightforward to unit-test.
@@ -206,20 +237,24 @@ export function composeSubagentChildEnv(
     ...parentProcessEnv,
     ...(inheritedApiKey && { LETTA_API_KEY: inheritedApiKey }),
     ...(inheritedBaseUrl && { LETTA_BASE_URL: inheritedBaseUrl }),
-    ...(actingUserId && { [ACTING_USER_ID_ENV]: actingUserId }),
     LETTA_CODE_AGENT_ROLE: "subagent",
+    [MEMORY_WORKER_SESSION_ENV]: subagentType === "memory" ? "1" : undefined,
     [SUBAGENT_LAUNCH_ENV]: "1",
     [SUBAGENT_LAUNCH_PROFILE_ENV]: launchProfile ?? "default",
-    ...(subagentType === "reflection" && {
+    ...((subagentType === "reflection" || subagentType === "memory") && {
       [LETTA_MOD_CAPABILITY_PROFILE_ENV]: PROVIDERS_ONLY_MOD_CAPABILITY_PROFILE,
     }),
     // Replace inherited parent addresses even when the new scope is unknown.
     LETTA_PARENT_AGENT_ID: parentAgentId,
     LETTA_PARENT_CONVERSATION_ID: options.parentConversationId,
+    // Children are one level below the process (or listener turn) launching them.
+    [SUBAGENT_DEPTH_ENV]: String(readSubagentDepth(parentProcessEnv) + 1),
     ...(transcriptPath && { TRANSCRIPT_PATH: transcriptPath }),
   };
 
   // A nested launch must never reuse its parent's assigned creation name.
+  if (actingUserId) childEnv[ACTING_USER_ID_ENV] = actingUserId;
+  else if (actingUserId === null) delete childEnv[ACTING_USER_ID_ENV];
   delete childEnv[SUBAGENT_NAME_ENV];
   if (options.subagentName) childEnv[SUBAGENT_NAME_ENV] = options.subagentName;
 
@@ -237,6 +272,10 @@ export function composeSubagentChildEnv(
   // at all — their tools will surface resolution errors appropriately.
   if (launchProfile === "memory-subagent") {
     delete childEnv[LISTENER_CONNECTION_ENV];
+    childEnv.LETTA_SCRATCHPAD = resolveMemorySubagentScratchpad(
+      parentProcessEnv,
+      options.subagentId,
+    );
     const primaryRoot = memoryScope?.primaryRoot ?? inheritedPrimaryRoot;
     if (primaryRoot) {
       childEnv.MEMORY_DIR = primaryRoot;
@@ -247,9 +286,41 @@ export function composeSubagentChildEnv(
     }
   } else if (listenerConnectionId?.startsWith("conn-")) {
     childEnv[LISTENER_CONNECTION_ENV] = listenerConnectionId;
+  } else if (
+    isUnattachedListenerLaunch({
+      listenerConnectionId,
+      launchProfile,
+      listenerConnectionCount: getActiveRuntime()?.connections.size ?? 0,
+    })
+  ) {
+    // A direct-API child inside a listener is unowned; later sends to it
+    // start a second harness on its conversation.
+    trackBoundaryError({
+      errorType: "subagent_launch_missing_listener_connection",
+      error: new Error(
+        "Subagent launched in a listener without its connection",
+      ),
+      context: "subagent_launch",
+    });
   }
 
   return childEnv;
+}
+
+/**
+ * A child launched inside a running listener but without its connection would
+ * fall back to a direct-API process that no listener owns.
+ */
+export function isUnattachedListenerLaunch(options: {
+  listenerConnectionId?: string | null;
+  launchProfile?: string;
+  listenerConnectionCount: number;
+}): boolean {
+  return (
+    !options.listenerConnectionId &&
+    options.launchProfile !== "memory-subagent" &&
+    options.listenerConnectionCount > 0
+  );
 }
 
 export function shouldLaunchThroughListener(options: {

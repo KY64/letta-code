@@ -42,6 +42,7 @@ import {
 } from "./backend";
 import { getBillingTier } from "./backend/api/metadata";
 import { LOCAL_BACKEND_EXPERIMENTAL_ENV } from "./backend/local/paths";
+import { startBrowserDiscoveryServer } from "./browser-discovery-server";
 import {
   extractBackendFlag,
   type ParsedCliArgs,
@@ -62,6 +63,7 @@ import type { ApprovalRequest } from "./cli/helpers/stream";
 import { initTerminalTheme } from "./cli/helpers/terminal-theme";
 import { ProfileSelectionInline } from "./cli/profile-selection";
 import {
+  createStartupAgentPickerHandler,
   getStartupBackendLookupOrder,
   inferBackendModeFromAgentId,
   resolveSubcommandBackendMode,
@@ -85,10 +87,11 @@ import {
 } from "./settings-manager";
 import { startStartupAutoUpdateCheck } from "./startup-auto-update";
 import {
+  clearPersistedClientToolRules,
   loadStartupTools,
-  type StartupToolsetPreference,
-} from "./tools/letta-toolset";
-import { clearPersistedClientToolRules } from "./tools/toolset";
+} from "./tools/toolset";
+import { isToolsetPreference, TOOLSET_OPTIONS } from "./tools/toolset-catalog";
+import type { ToolsetPreference } from "./tools/toolset-types";
 import { debugLog, debugWarn, isDebugEnabled } from "./utils/debug";
 import { startOrphanDetection } from "./utils/orphan-detection";
 import { markMilestone } from "./utils/timing";
@@ -569,9 +572,7 @@ async function getLocalBackendStartupFallbackSession(
 async function main(): Promise<void> {
   markMilestone("CLI_START");
   await initializeDesktopCredentials();
-
-  // Exit when the owning Desktop or terminal process dies.
-  startOrphanDetection();
+  startOrphanDetection(); // Exit when the owning Desktop or terminal process dies.
 
   const rawCliArgs = process.argv.slice(2);
   let subcommandArgs = rawCliArgs;
@@ -595,17 +596,17 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
+  const localBackendEnvValue = process.env[LOCAL_BACKEND_EXPERIMENTAL_ENV];
+  const envBackendMode =
+    localBackendEnvValue === undefined
+      ? undefined
+      : localBackendEnvValue === "1" ||
+          localBackendEnvValue.toLowerCase() === "true"
+        ? "local"
+        : "api";
   if (subcommandNeedsEarlyBackendMode(subcommandArgs[0])) {
     const savedBackendSettings =
       settingsManager.readStartupBackendSettingsSync();
-    const localBackendEnvValue = process.env[LOCAL_BACKEND_EXPERIMENTAL_ENV];
-    const envBackendMode =
-      localBackendEnvValue === undefined
-        ? undefined
-        : localBackendEnvValue === "1" ||
-            localBackendEnvValue.toLowerCase() === "true"
-          ? "local"
-          : "api";
     const backendMode = resolveSubcommandBackendMode({
       explicitBackendMode,
       envBackendMode,
@@ -766,11 +767,13 @@ async function main(): Promise<void> {
     configureBackendMode(inferredBackendModeFromAgentId);
   }
   const setupLocalModeDisabledReason =
-    !explicitBackendMode &&
-    specifiedAgentId &&
-    inferredBackendModeFromAgentId === "api"
-      ? `Agent ${specifiedAgentId} requires Letta sign-in. Sign in with Letta to access it, or rerun without --agent to start locally.`
-      : undefined;
+    explicitBackendMode === "api"
+      ? "--backend cloud requires Letta sign-in. Rerun with --backend local to start locally."
+      : !explicitBackendMode &&
+          specifiedAgentId &&
+          inferredBackendModeFromAgentId === "api"
+        ? `Agent ${specifiedAgentId} requires Letta sign-in. Sign in with Letta to access it, or rerun without --agent to start locally.`
+        : undefined;
   const specifiedModel = values.model ?? undefined;
   const systemPromptPreset = values.system ?? undefined;
   const systemCustom = values["system-custom"] ?? undefined;
@@ -853,31 +856,17 @@ async function main(): Promise<void> {
     }
   };
 
-  if (
-    !explicitBackendMode &&
-    !inferredBackendModeFromAgentId &&
-    settings.preferredBackendMode === "local" &&
-    baseURL === LETTA_CLOUD_API_URL
-  ) {
+  const startupBackendMode = resolveSubcommandBackendMode({
+    explicitBackendMode: explicitBackendMode ?? inferredBackendModeFromAgentId,
+    envBackendMode,
+    savedBackendMode: settings.preferredBackendMode,
+    baseURL,
+    cloudBaseURL: LETTA_CLOUD_API_URL,
+  });
+  if (startupBackendMode === "local") {
     await tryConfigureStartupLocalBackend();
-  }
-
-  // Local-first new-user flow: if the user has no Letta Cloud credentials and
-  // did not explicitly request a backend, start in local mode immediately so
-  // they can type right away. Existing local agents will be resumed below; if
-  // none exist, startup falls through to local default-agent creation.
-  if (
-    !explicitBackendMode &&
-    !inferredBackendModeFromAgentId &&
-    !isHeadless &&
-    baseURL === LETTA_CLOUD_API_URL &&
-    !settings.refreshToken &&
-    !apiKey
-  ) {
-    if (await tryConfigureStartupLocalBackend()) {
-      settingsManager.updateSettings({ preferredBackendMode: "local" });
-      await settingsManager.flush();
-    }
+  } else if (startupBackendMode === "api") {
+    configureBackendMode("api");
   }
 
   const startupTargetLookupOrder = getStartupTargetLookupOrderForCredentials({
@@ -946,17 +935,10 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Validate toolset if provided
-  if (
-    specifiedToolset &&
-    specifiedToolset !== "codex" &&
-    specifiedToolset !== "default" &&
-    specifiedToolset !== "gemini" &&
-    specifiedToolset !== "letta" &&
-    specifiedToolset !== "auto"
-  ) {
+  // Validate against the same options advertised by /toolset and the listener.
+  if (specifiedToolset && !isToolsetPreference(specifiedToolset)) {
     console.error(
-      `Error: Invalid toolset "${specifiedToolset}". Must be "auto", "letta", "codex", "default", or "gemini".`,
+      `Error: Invalid toolset "${specifiedToolset}". Must be ${TOOLSET_OPTIONS.map((option) => `"${option.id}"`).join(", ")}.`,
     );
     process.exit(1);
   }
@@ -1063,6 +1045,7 @@ async function main(): Promise<void> {
       const { runSetup } = await import("@/auth/setup");
       const setupResult = await runSetup({
         localModeDisabledReason: setupLocalModeDisabledReason,
+        persistBackendPreference: !explicitBackendMode,
       });
       if (setupResult.kind === "cancelled") {
         process.exit(0);
@@ -1088,6 +1071,7 @@ async function main(): Promise<void> {
       const { runSetup } = await import("@/auth/setup");
       const setupResult = await runSetup({
         localModeDisabledReason: setupLocalModeDisabledReason,
+        persistBackendPreference: !explicitBackendMode,
       });
       if (setupResult.kind === "cancelled") {
         process.exit(0);
@@ -1140,25 +1124,6 @@ async function main(): Promise<void> {
         }
       }
       markMilestone("CREDENTIALS_VALIDATED");
-
-      // Bootstrap after credential validation. Only interactive startup
-      // backgrounds the request.
-      if (isValid) {
-        const bootstrapPromise = import("@/agent/bootstrap-tools").then(
-          ({ bootstrapBaseToolsIfNeeded }) =>
-            bootstrapBaseToolsIfNeeded({ quiet: isHeadless }),
-        );
-        if (isHeadless) {
-          await bootstrapPromise;
-        } else {
-          void bootstrapPromise.catch((error) => {
-            debugWarn(
-              "startup",
-              `Failed to bootstrap base tools: ${error instanceof Error ? error.message : String(error)}`,
-            );
-          });
-        }
-      }
 
       if (!isValid) {
         const validationFailure = credentialValidation.ok
@@ -1218,6 +1183,7 @@ async function main(): Promise<void> {
         const setupResult = await runSetup({
           initialMode: baseURL === LETTA_CLOUD_API_URL ? "device-code" : "menu",
           localModeDisabledReason: setupLocalModeDisabledReason,
+          persistBackendPreference: !explicitBackendMode,
         });
         if (setupResult.kind === "cancelled") {
           process.exit(0);
@@ -1310,8 +1276,7 @@ async function main(): Promise<void> {
     // For headless mode, load tools synchronously (respecting model/toolset when provided)
     await loadStartupTools({
       modelIdentifier: specifiedModel,
-      toolset: specifiedToolset as StartupToolsetPreference | undefined,
-      exclude: ["AskUserQuestion"],
+      toolset: specifiedToolset as ToolsetPreference | undefined,
     });
     markMilestone("TOOLS_LOADED");
 
@@ -1365,7 +1330,7 @@ async function main(): Promise<void> {
     preResolvedAgent?: AgentState | null;
     model?: string;
     systemPromptPreset?: string;
-    toolset?: StartupToolsetPreference;
+    toolset?: ToolsetPreference;
     skillsDirectory?: string;
   }) {
     const [showKeybindingSetup, setShowKeybindingSetup] = useState<
@@ -2463,7 +2428,6 @@ async function main(): Promise<void> {
     if (showKeybindingSetup === null) {
       return null;
     }
-
     // During initial "selecting" phase, render ProfileSelectionInline with loading state
     // to prevent component tree switch whitespace artifacts
     if (loadingState === "selecting") {
@@ -2476,7 +2440,6 @@ async function main(): Promise<void> {
         onExit: () => process.exit(0),
       });
     }
-
     // Show conversation selector for --resume flag
     if (loadingState === "selecting_conversation" && resumeAgentId) {
       return React.createElement(ConversationSelector, {
@@ -2496,7 +2459,6 @@ async function main(): Promise<void> {
         },
       });
     }
-
     // Show global agent selector in fresh repos with global pinned agents
     if (loadingState === "selecting_global") {
       return React.createElement(ProfileSelectionInline, {
@@ -2509,10 +2471,12 @@ async function main(): Promise<void> {
           availableServerModels.length > 0 ? availableServerModels : undefined,
         defaultModelHandle: customApiDefaultModel ?? undefined,
         serverBaseUrl: customApiBaseUrl ?? undefined,
-        onSelect: (agentId: string) => {
-          setSelectedGlobalAgentId(agentId);
-          setLoadingState("assembling");
-        },
+        onSelect: createStartupAgentPickerHandler(
+          tryConfigureStartupLocalBackend,
+          setSelectedGlobalAgentId,
+          () => setLoadingState("assembling"),
+          setFailedAgentMessage,
+        ),
         onCreateNew: () => {
           setUserRequestedNewAgent(true);
           setLoadingState("assembling");
@@ -2589,7 +2553,6 @@ async function main(): Promise<void> {
       fileAutocompleteFdPath,
     });
   }
-
   markMilestone("REACT_RENDER_START");
   render(
     React.createElement(LoadingApp, {
@@ -2599,7 +2562,7 @@ async function main(): Promise<void> {
       preResolvedAgent: nameResolvedAgent,
       model: specifiedModel,
       systemPromptPreset: systemPromptPreset,
-      toolset: specifiedToolset as StartupToolsetPreference | undefined,
+      toolset: specifiedToolset as ToolsetPreference | undefined,
       skillsDirectory: skillsDirectory,
     }),
     {
@@ -2607,6 +2570,6 @@ async function main(): Promise<void> {
     },
   );
 }
-
 assertSupportedBunRuntime();
+void startBrowserDiscoveryServer().ready.catch(() => undefined);
 main();
