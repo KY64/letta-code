@@ -2,7 +2,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { APIConnectionError } from "@letta-ai/letta-client/core/error";
-import type { Message } from "@letta-ai/letta-client/resources/agents/messages";
+import type {
+  Message,
+  Run,
+} from "@letta-ai/letta-client/resources/agents/messages";
+import { isManagedCloudRuntime } from "@/managed-cloud-runtime";
 import {
   type ChatGPTUsageSnapshot,
   normalizeCloudChatGPTUsageResponse,
@@ -23,6 +27,7 @@ import {
   type ReflectionRunRequest,
 } from "./api/reflection-runs";
 import { isCloudServerUrl } from "./api/server-url";
+import { conversationCostModel, withClientUsageCost } from "./api/usage-cost";
 import {
   type BackendMode,
   resolveBackendMode,
@@ -349,6 +354,9 @@ export interface Backend {
     runId?: string | null,
   ): Promise<Awaited<ReturnType<APIClient["agents"]["messages"]["cancel"]>>>;
 
+  /** Latest run created for this conversation, or null when none exists. */
+  latestConversationRun(conversationId: string): Promise<Run | null>;
+
   retrieveRun(
     runId: string,
     options?: RunRetrieveOptions,
@@ -384,8 +392,10 @@ export class APIBackend implements Backend {
       localModelCatalog: false,
       localMemfs: false,
       // Environment routing only exists on Letta Cloud; an APIBackend pointed
-      // at a self-hosted or remote app server has no environments API.
-      environmentRouting: isCloudServerUrl(),
+      // at a self-hosted or remote app server has no environments API. A
+      // Cloud sandbox may reach Cloud through another hostname, so its
+      // managed-runtime marker also counts.
+      environmentRouting: isCloudServerUrl() || isManagedCloudRuntime(),
     };
   }
 
@@ -644,6 +654,14 @@ export class APIBackend implements Backend {
         message: `Connection error: expected text/event-stream, received ${contentType || "no content type"} (HTTP ${response.status}).`,
       });
     }
+    withClientUsageCost(stream, () =>
+      conversationCostModel(
+        client,
+        conversationId,
+        body?.agent_id,
+        body.override_model,
+      ),
+    );
     return stream;
   }
 
@@ -653,7 +671,15 @@ export class APIBackend implements Backend {
     options?: ConversationMessageStreamOptions,
   ) {
     const client = await this.getClient();
-    return client.conversations.messages.stream(conversationId, body, options);
+    const stream = await client.conversations.messages.stream(
+      conversationId,
+      body,
+      options,
+    );
+    withClientUsageCost(stream, () =>
+      conversationCostModel(client, conversationId, body?.agent_id),
+    );
+    return stream;
   }
 
   async cancelConversation(conversationIdOrAgentId: string) {
@@ -679,6 +705,16 @@ export class APIBackend implements Backend {
     );
   }
 
+  async latestConversationRun(conversationId: string): Promise<Run | null> {
+    const client = await this.getClient();
+    const runs = await client.runs.list({
+      conversation_id: conversationId,
+      order: "desc",
+      limit: 1,
+    });
+    return runs.getPaginatedItems()[0] ?? null;
+  }
+
   async retrieveRun(runId: string, options?: RunRetrieveOptions) {
     const client = await this.getClient();
     return client.runs.retrieve(runId, options);
@@ -690,7 +726,16 @@ export class APIBackend implements Backend {
     options?: RunMessageStreamOptions,
   ) {
     const client = await this.getClient();
-    return client.runs.messages.stream(runId, body, options);
+    const stream = await client.runs.messages.stream(runId, body, options);
+    withClientUsageCost(stream, async () => {
+      const run = await client.runs.retrieve(runId);
+      return conversationCostModel(
+        client,
+        run.conversation_id ?? "default",
+        run.agent_id,
+      );
+    });
+    return stream;
   }
 
   async forkConversation(

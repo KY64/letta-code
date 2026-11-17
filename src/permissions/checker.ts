@@ -1,7 +1,7 @@
 // src/permissions/checker.ts
 // Main permission checking logic
 
-import { resolve } from "node:path";
+import { posix, resolve, win32 } from "node:path";
 import { getCurrentAgentId } from "@/agent/context";
 import { runPermissionRequestHooks } from "@/hooks";
 import {
@@ -24,6 +24,7 @@ import {
 } from "./canonical";
 import { cliPermissions } from "./cli-permissions-instance";
 import { evaluateCrossAgentGuard, extractFilePath } from "./cross-agent-guard";
+import { expandPathArgs } from "./file-path-args";
 import {
   type MatcherOptions,
   matchesBashPattern,
@@ -125,6 +126,7 @@ export function checkPermission(
   agentId?: string,
   modTools: Map<string, ModToolDefinition> = getAvailableModToolsRegistry(),
 ): PermissionCheckResult {
+  toolArgs = expandPathArgs(toolName, toolArgs, workingDirectory);
   const engine: PermissionEngine = isPermissionsV2Enabled() ? "v2" : "v1";
   const primary = checkPermissionForEngine(
     engine,
@@ -611,6 +613,31 @@ function checkPermissionForEngine(
 }
 
 /**
+ * Check whether `child` is `root` or a path nested under it, comparing whole
+ * path segments rather than string prefixes (so `/x/project2` is NOT within
+ * `/x/project`). Handles trailing separators, drive letters and UNC paths via
+ * the platform path implementation; Windows comparisons are case-insensitive.
+ */
+export function isPathWithin(
+  child: string,
+  root: string,
+  pathImpl: typeof posix = process.platform === "win32" ? win32 : posix,
+): boolean {
+  const caseInsensitive = pathImpl === win32;
+  const normalizedChild = caseInsensitive ? child.toLowerCase() : child;
+  const normalizedRoot = caseInsensitive ? root.toLowerCase() : root;
+  const rel = pathImpl.relative(normalizedRoot, normalizedChild);
+  if (rel === "") {
+    return true;
+  }
+  return (
+    rel !== ".." &&
+    !rel.startsWith(`..${pathImpl.sep}`) &&
+    !pathImpl.isAbsolute(rel)
+  );
+}
+
+/**
  * Check if file path is within allowed directories
  * (working directory + additionalDirectories)
  */
@@ -622,7 +649,7 @@ function isWithinAllowedDirectories(
   const absolutePath = resolve(workingDirectory, filePath);
 
   // Check if within working directory
-  if (absolutePath.startsWith(workingDirectory)) {
+  if (isPathWithin(absolutePath, resolve(workingDirectory))) {
     return true;
   }
 
@@ -630,7 +657,7 @@ function isWithinAllowedDirectories(
   if (permissions.additionalDirectories) {
     for (const dir of permissions.additionalDirectories) {
       const resolvedDir = resolve(workingDirectory, dir);
-      if (absolutePath.startsWith(resolvedDir)) {
+      if (isPathWithin(absolutePath, resolvedDir)) {
         return true;
       }
     }
@@ -735,7 +762,7 @@ function matchesPattern(
 }
 
 /**
- * Subagent types that are safe to auto-approve by default.
+ * Letta subagent types (`subagent_type`) that are safe to auto-approve by default.
  * Some are read-only explorers; others are memory-rooted writers whose
  * mutations are constrained by the memory-subagent sandbox.
  */
@@ -744,7 +771,7 @@ const SAFE_AUTO_APPROVE_SUBAGENT_TYPES = new Set([
   "Recall",
   "reflection", // Memory reflection - writes constrained by memory-subagent sandbox
   "Reflection",
-  "memory", // Memory worker - edits its private memory worktree under the same sandbox
+  "memory", // Memory repair worker - repairs its memory checkout under the same sandbox
 ]);
 
 /**
@@ -836,6 +863,7 @@ export async function checkPermissionWithHooks(
   modTools: Map<string, ModToolDefinition> = getAvailableModToolsRegistry(),
   modPermissionOptions: ModPermissionCheckOptions = {},
 ): Promise<PermissionCheckResult> {
+  toolArgs = expandPathArgs(toolName, toolArgs, workingDirectory);
   // First, check permission using normal rules
   let result = checkPermission(
     toolName,

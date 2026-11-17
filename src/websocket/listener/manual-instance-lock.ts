@@ -12,8 +12,15 @@
 
 import { createHash, randomUUID } from "node:crypto";
 import { link, mkdir, readFile, rm, unlink, writeFile } from "node:fs/promises";
-import { homedir } from "node:os";
+import { uptime } from "node:os";
 import path from "node:path";
+import {
+  getOwnProcessStartTime,
+  getProcessCommand,
+  getProcessStartTime,
+  isPidReusedByNonLetta,
+} from "@/utils/process-liveness";
+import { resolveGlobalConfigDir } from "@/utils/settings-path";
 
 export interface ManualListenerLockScope {
   serverUrl: string;
@@ -32,6 +39,7 @@ interface ManualListenerLockRecord {
   ownerToken: string;
   acquiredAt: string;
   scopeHash: string;
+  started?: string;
 }
 
 interface ManualListenerLockDeps {
@@ -39,9 +47,17 @@ interface ManualListenerLockDeps {
   processId: number;
   ownerToken: string;
   isProcessAlive: (pid: number) => boolean;
+  /** Epoch ms of the current OS boot, used to spot pids reused after reboot. */
+  bootTimeMs: number;
+  /** Returns the pid's command line, or null when it cannot be determined. */
+  getProcessCommand: (pid: number) => string | null;
+  getOwnProcessStartTime: () => Promise<string | null>;
+  getProcessStartTime: (pid: number) => Promise<string | null>;
 }
 
 const RECOVERY_MAX_DEPTH = 64;
+// Tolerates clock jitter between `acquiredAt` and the uptime-derived boot time.
+const BOOT_TIME_SLACK_MS = 60_000;
 
 export class ManualListenerAlreadyRunningError extends Error {
   readonly holderPid: number;
@@ -85,11 +101,41 @@ function defaultIsProcessAlive(pid: number): boolean {
   }
 }
 
-function getDefaultLockRoot(): string {
+function getDefaultBootTimeMs(): number {
+  return Date.now() - uptime() * 1000;
+}
+
+/**
+ * For legacy records without a start time, a live pid recorded before the
+ * current boot may have been reused after a reboot. The boot estimate moves
+ * with the wall clock, so it only prompts a closer look: the owner is treated
+ * as stale only when its pid is positively identified as something other than
+ * letta.
+ */
+async function isOwnerAlive(
+  record: ManualListenerLockRecord,
+  deps: ManualListenerLockDeps,
+): Promise<boolean> {
+  if (!deps.isProcessAlive(record.pid)) return false;
+  if (record.started) {
+    const started = await deps.getProcessStartTime(record.pid);
+    return started === null || started === record.started;
+  }
+  const acquiredAtMs = Date.parse(record.acquiredAt);
+  if (
+    !Number.isFinite(acquiredAtMs) ||
+    acquiredAtMs >= deps.bootTimeMs - BOOT_TIME_SLACK_MS
+  ) {
+    return true;
+  }
+  return !isPidReusedByNonLetta(record.pid, deps.getProcessCommand);
+}
+
+export function getManualListenerLockRoot(): string {
   // The device id used in the registration key is stored under this same
-  // HOME-scoped `.letta` directory. An unrelated LETTA_HOME override must not
+  // product-scoped config directory. An unrelated LETTA_HOME override must not
   // split locks for processes that still share that device identity.
-  return path.join(process.env.HOME || homedir(), ".letta");
+  return resolveGlobalConfigDir();
 }
 
 export function normalizeManualListenerServerUrl(serverUrl: string): string {
@@ -141,6 +187,8 @@ function parseLockRecord(
       typeof parsed.ownerToken !== "string" ||
       parsed.ownerToken.length === 0 ||
       typeof parsed.acquiredAt !== "string" ||
+      (parsed.started !== undefined &&
+        (typeof parsed.started !== "string" || parsed.started.length === 0)) ||
       parsed.scopeHash !== expectedScopeHash
     ) {
       return null;
@@ -240,7 +288,7 @@ async function recoverDeadOwner(
           lockPath,
         );
       }
-      if (deps.isProcessAlive(claimOwner.pid)) {
+      if (await isOwnerAlive(claimOwner, deps)) {
         return false;
       }
     }
@@ -283,20 +331,26 @@ export async function acquireManualListenerLock(
 ): Promise<ManualListenerLockHandle> {
   const scopeHash = getManualListenerScopeHash(scope);
   const deps: ManualListenerLockDeps = {
-    lockRoot: getDefaultLockRoot(),
+    lockRoot: getManualListenerLockRoot(),
     processId: process.pid,
     ownerToken: randomUUID(),
     isProcessAlive: defaultIsProcessAlive,
+    bootTimeMs: getDefaultBootTimeMs(),
+    getProcessCommand,
+    getOwnProcessStartTime,
+    getProcessStartTime,
     ...overrides,
   };
   const listenerLockDir = path.join(deps.lockRoot, "listeners");
   const lockPath = path.join(listenerLockDir, `manual-${scopeHash}.lock`);
+  const started = (await deps.getOwnProcessStartTime()) ?? undefined;
   const ownerRecord: ManualListenerLockRecord = {
     version: 1,
     pid: deps.processId,
     ownerToken: deps.ownerToken,
     acquiredAt: new Date().toISOString(),
     scopeHash,
+    ...(started ? { started } : {}),
   };
   const ownerContents = JSON.stringify(ownerRecord);
 
@@ -369,7 +423,7 @@ export async function acquireManualListenerLock(
         lockPath,
       );
     }
-    if (deps.isProcessAlive(incumbent.pid)) {
+    if (await isOwnerAlive(incumbent, deps)) {
       throw new ManualListenerAlreadyRunningError(incumbent.pid, lockPath);
     }
 

@@ -1,11 +1,12 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
   filterStructuredOutputRows,
   structuredOutputSupport,
 } from "@/cli/subcommands/model";
+import { removeTestDir } from "@/test-utils/test-fs";
 
 test("a BYOK model's capability overrides a matching hosted preset", () => {
   const preset = {
@@ -184,7 +185,7 @@ describe("model CLI", () => {
   }, 30000);
 
   afterAll(async () => {
-    if (home) await rm(home, { recursive: true, force: true });
+    if (home) await removeTestDir(home);
   });
 
   test("removes agents config and its help/options", async () => {
@@ -225,6 +226,61 @@ describe("model CLI", () => {
       );
     }
   }, 30000);
+
+  for (const args of [
+    ["get", "--worker", "codex"],
+    ["set", "opus", "--worker", "claude-code"],
+    ["list", "--worker", "unknown"],
+    ["list", "--worker", "codex", "--byok"],
+    ["list", "--worker", "codex", "--hosted"],
+    ["list", "--worker", "codex", "--structured-outputs"],
+    ["list", "--worker", "codex", "--agent", "agent-example"],
+  ]) {
+    test(`rejects invalid worker discovery options: ${args.join(" ")}`, async () => {
+      const result = await cli(args);
+      expect(result.code, result.stderr).toBe(1);
+      expect(result.stdout.trim()).toBe("");
+    }, 30000);
+  }
+
+  test("lists Cursor's native catalog and fails closed without a key", async () => {
+    const server = Bun.serve({
+      port: 0,
+      fetch: () =>
+        Response.json({
+          items: [
+            { id: "default", displayName: "Auto", aliases: ["auto"] },
+            { id: "composer-2.5", displayName: "Composer 2.5" },
+          ],
+        }),
+    });
+    try {
+      const noAgent = { AGENT_ID: undefined, LETTA_AGENT_ID: undefined };
+      const listed = await cli(["list", "--worker", "cursor"], {
+        ...noAgent,
+        CURSOR_API_KEY: "test-not-a-key",
+        CURSOR_BACKEND_URL: `http://127.0.0.1:${server.port}`,
+      });
+      expect(listed.code, listed.stderr).toBe(0);
+      expect(JSON.parse(listed.stdout)).toMatchObject({
+        worker: "cursor",
+        computer: "local",
+        models: [
+          { id: "default", display_name: "Auto", aliases: ["auto"] },
+          { id: "composer-2.5", display_name: "Composer 2.5" },
+        ],
+      });
+      const missing = await cli(["list", "--worker", "cursor"], {
+        ...noAgent,
+        CURSOR_API_KEY: undefined,
+      });
+      expect(missing.code).toBe(1);
+      expect(missing.stdout.trim()).toBe("");
+      expect(missing.stderr).toContain("CURSOR_API_KEY");
+    } finally {
+      server.stop(true);
+    }
+  }, 60000);
 
   test("filters the local inventory as BYOK, with no hosted models", async () => {
     const byok = await cli(["list", "--byok"]);

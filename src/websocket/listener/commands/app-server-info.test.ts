@@ -55,9 +55,10 @@ describe("app-server info protocol", () => {
         subagent_message: true,
         runtime_workspace_sandbox: true,
         runtime_external_tools_update: true,
+        runtime_tool_policy: true,
+        runtime_tool_policy_foreground_yield: true,
         structured_outputs: false,
         write_file_base64: true,
-        mcp_originator_queue_isolation: true,
         split_channels: false,
       },
     });
@@ -69,24 +70,6 @@ describe("app-server info protocol", () => {
       { backend: "api", version: "0.32.14" },
     );
     expect(response.capabilities.structured_outputs).toBe(true);
+    expect(isAppServerInfoResponseMessage(response)).toBe(true);
   });
-});
-
-test("queue isolation capability is optional boolean, not inferred for old listeners", () => {
-  const response = buildAppServerInfoResponse(
-    { type: "app_server_info", request_id: "old" },
-    { backend: "api", version: "old" },
-  );
-  delete response.capabilities.mcp_originator_queue_isolation;
-  expect(isAppServerInfoResponseMessage(response)).toBe(true);
-  expect(response.capabilities.mcp_originator_queue_isolation).toBeUndefined();
-  expect(
-    isAppServerInfoResponseMessage({
-      ...response,
-      capabilities: {
-        ...response.capabilities,
-        mcp_originator_queue_isolation: "true",
-      },
-    }),
-  ).toBe(false);
 });

@@ -50,7 +50,7 @@ import type {
 import type { ConversationForkBody } from "./conversation-fork-protocol";
 import type * as CwdProtocol from "./cwd-protocol";
 import type {
-  ExternalToolCallRequestMessage,
+  ExternalToolCallMessage,
   ExternalToolCallResponseCommand,
   RuntimeExternalToolsUpdateCommand,
   RuntimeExternalToolsUpdateResponseMessage,
@@ -107,6 +107,7 @@ export type * from "./toolset-protocol";
 
 export type DmPolicy = "pairing" | "allowlist" | "open";
 export type ExperimentId =
+  | "cloud_monitors"
   | "artifacts"
   | "conversation_titles"
   | "desktop_conversation_bootstrap"
@@ -114,7 +115,6 @@ export type ExperimentId =
   | "memory_palace"
   | "reflection_arena"
   | "tui_cron";
-
 export type ExperimentSource = "override" | "env" | "default";
 
 export interface ExperimentSnapshot {
@@ -428,8 +428,6 @@ export type QueueMessageKind =
   | "message"
   | "task_notification"
   | "cron_prompt"
-  | "approval_result"
-  | "overlay_action"
   | "mod_continue";
 
 export type QueueMessageSource =
@@ -464,7 +462,7 @@ export interface LoopStatusUpdateMessage extends RuntimeEnvelope {
 export interface QueueUpdateMessage extends RuntimeEnvelope {
   type: "update_queue";
   queue: QueueMessage[];
-  removed: import("./queue-update-protocol").QueueRemovalTransition[];
+  removed?: import("./queue-update-protocol").QueueRemovalTransition[];
 }
 
 /** Standard Letta message delta forwarded through the stream channel. */
@@ -549,7 +547,7 @@ export interface SubagentSnapshotToolCall {
   args: string;
 }
 
-export interface SubagentSnapshot {
+export interface SubagentSnapshot extends SubagentProtocol.SubagentEvents {
   subagent_id: string;
   subagent_type: string;
   description: string;
@@ -568,11 +566,11 @@ export interface SubagentSnapshot {
   parent_conversation_id?: string;
   start_time: number;
   tool_calls: SubagentSnapshotToolCall[];
+  progress_texts?: { id: string; at: string; text: string }[]; // Absent = none
   total_tokens: number;
   duration_ms: number;
   error?: string;
-  /** Truncated final report, set for `notify: "caller"` launches. */
-  result?: string;
+  result?: string; // Truncated final report for `notify: "caller"` launches.
 }
 
 export interface SubagentStateUpdateMessage extends RuntimeEnvelope {
@@ -599,13 +597,13 @@ export type {
   ClientToolsetConfig,
   InputCreateMessagePayload,
 } from "./input-create-message";
-
 export interface InputAcceptedResponseMessage {
   type: "input_accepted";
   request_id: string;
   runtime: ConversationRuntimeScope;
   accepted: boolean;
   disposition?: "started" | "queued";
+  duplicate_owner_live?: boolean;
   error?: string;
 }
 
@@ -2311,7 +2309,7 @@ export type WsProtocolMessage =
   | StreamDeltaMessage
   | TurnFinishedMessage
   | SubagentStateUpdateMessage
-  | ExternalToolCallRequestMessage
+  | ExternalToolCallMessage
   | AbortMessageResponseMessage
   | import("./queue-update-protocol").ResumeQueueResponseMessage
   | SyncResponseMessage

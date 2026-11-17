@@ -6,7 +6,7 @@
 
 import { mkdirSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { ACTING_USER_ID_ENV } from "@/agent/acting-user";
@@ -23,6 +23,7 @@ import {
   peekOrganizationId,
   warmOrganizationId,
 } from "@/agent/organization-id";
+import { resolveDetachedSubagentEnvAgentId } from "@/agent/subagents/ephemeral-subagent";
 import { getDesktopAccessToken } from "@/auth/desktop-credentials";
 import { peekOrgAccessToken } from "@/auth/org-credentials-session";
 import { getServerUrl } from "@/backend/api/server-url";
@@ -31,9 +32,11 @@ import {
   getCurrentWorkingDirectory,
   getRuntimeActingUserId,
   getRuntimeContext,
+  getRuntimeSessionSource,
 } from "@/runtime-context";
 import { getRuntimeExecutionEnv } from "@/runtime-execution-settings";
 import { settingsManager } from "@/settings-manager";
+import { resolveGlobalConfigDir } from "@/utils/settings-path";
 import { LISTENER_CONNECTION_ENV } from "@/utils/subagent-launch-marker";
 import { getRipgrepBinDir } from "./ripgrep-manager.js";
 
@@ -171,7 +174,7 @@ export function getLettaShimDir(env: NodeJS.ProcessEnv = process.env): string {
   // harness state when already sandboxed. `~/.letta` is writable in that profile,
   // while the cross-agent memory subtrees inside it remain masked.
   if (env.LETTA_SANDBOX) {
-    return path.join(homedir(), ".letta", SHELL_SHIM_DIR_NAME);
+    return path.join(resolveGlobalConfigDir(env), SHELL_SHIM_DIR_NAME);
   }
 
   return path.join(tmpdir(), SHELL_SHIM_DIR_NAME);
@@ -366,6 +369,9 @@ export function getShellEnv(): NodeJS.ProcessEnv {
 
   // Commands started by a listener turn must inherit that listener's registered
   // device identity, not a stale installation id from the child CLI settings.
+  const sessionSource = getRuntimeSessionSource();
+  if (sessionSource) env.LETTA_RUNTIME_SESSION_SOURCE = sessionSource;
+  else delete env.LETTA_RUNTIME_SESSION_SOURCE;
   const environmentDeviceId = getRuntimeContext()?.environmentDeviceId?.trim();
   if (environmentDeviceId) {
     env.LETTA_RUNTIME_ENVIRONMENT_DEVICE_ID = environmentDeviceId;
@@ -411,8 +417,12 @@ export function getShellEnv(): NodeJS.ProcessEnv {
   }
 
   if (agentId) {
-    env.LETTA_AGENT_ID = agentId;
-    env.AGENT_ID = agentId;
+    // A detached subagent conversation has no agent of its own; expose the
+    // parent agent it runs under rather than the conversation ID.
+    const exportedAgentId =
+      resolveDetachedSubagentEnvAgentId(agentId, executionEnv) ?? agentId;
+    env.LETTA_AGENT_ID = exportedAgentId;
+    env.AGENT_ID = exportedAgentId;
 
     const agentName = getCurrentAgentName()?.trim() || env.AGENT_NAME?.trim();
     if (agentName) {

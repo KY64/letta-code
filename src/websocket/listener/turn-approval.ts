@@ -46,7 +46,6 @@ import {
   emitToolExecutionStartedEvents,
   normalizeExecutionResultsForInterruptParity,
 } from "./interrupts";
-import type { McpOriginatorScope } from "./mcp-originator-scope";
 import { awaitOrderedOutboundDeliveries } from "./outbound-delivery";
 import { getOutboundQueueStats, OUTBOUND_QUEUE_LIMITS } from "./outbound-wire";
 import {
@@ -143,6 +142,7 @@ export async function handleApprovalStop(params: {
     toolName: string;
     toolArgs: string;
   }>;
+  onChunk?: Parameters<typeof executeApprovalBatch>[1];
   runtime: ConversationRuntime;
   socket: ListenerTransport;
   agentId?: string | null;
@@ -157,7 +157,6 @@ export async function handleApprovalStop(params: {
   turnToolContextId: string | null;
   turnLease: TurnLease;
   turnCorrelation?: TurnCorrelation;
-  activeOriginatorScope?: McpOriginatorScope;
   allowQueuedContinuation?: boolean;
   onConsumeQueuedTurn?: (queuedTurn: IncomingMessage) => void | Promise<void>;
   /** This turn's output is owned by an in-process caller, not a relay client. */
@@ -175,6 +174,8 @@ export async function handleApprovalStop(params: {
   buildSendOptions: () => Parameters<
     typeof sendApprovalContinuationWithRetry
   >[2];
+  /** Receives this batch's unsent results when the continuation send throws. */
+  onContinuationSendError?: (progress: ApprovalBranchProgress) => void;
   dependencies?: {
     classifyApprovals?: typeof classifyApprovalsWithSuggestions;
     executeApprovalBatch?: typeof executeApprovalBatch;
@@ -281,6 +282,10 @@ export async function handleApprovalStop(params: {
     agent_id: agentId,
     conversation_id: conversationId,
   };
+  const classificationPermissionMode = turnPermissionModeState.mode;
+  const classificationPermissionModeState = {
+    mode: classificationPermissionMode,
+  };
   const { autoAllowed, autoDenied, needsUserInput } = await classifyApprovals(
     approvals,
     {
@@ -288,7 +293,7 @@ export async function handleApprovalStop(params: {
       requireArgsForAutoApprove: true,
       missingNameReason: "Tool call incomplete - missing name",
       workingDirectory: turnWorkingDirectory,
-      permissionModeState: turnPermissionModeState,
+      permissionModeState: classificationPermissionModeState,
       agentId: agentId ?? undefined,
       toolContextId: turnToolContextId ?? undefined,
     },
@@ -320,6 +325,7 @@ export async function handleApprovalStop(params: {
     user_input_tool_call_ids: needsUserInput.map(
       (entry) => entry.approval.toolCallId,
     ),
+    permission_mode: classificationPermissionMode,
   };
   emitCanonicalMessageDelta(
     socket,
@@ -421,7 +427,7 @@ export async function handleApprovalStop(params: {
   const interruptTermination = (
     interruptedTurnInput: TurnInputState = turnInput,
     interruptedBatchId: string = dequeuedBatchId,
-  ): ApprovalBranchResult => {
+  ): ApprovalBranchProgress & { kind: "interrupted" } => {
     return {
       kind: "interrupted",
       turnInput: interruptedTurnInput,
@@ -537,7 +543,7 @@ export async function handleApprovalStop(params: {
                 requireArgsForAutoApprove: true,
                 missingNameReason: "Tool call incomplete - missing name",
                 workingDirectory: turnWorkingDirectory,
-                permissionModeState: turnPermissionModeState,
+                permissionModeState: classificationPermissionModeState,
                 agentId: agentId ?? undefined,
                 toolContextId: turnToolContextId ?? undefined,
               },
@@ -590,8 +596,6 @@ export async function handleApprovalStop(params: {
   );
   const executionRunId =
     runId || runtime.activeRunId || msgRunIds[msgRunIds.length - 1];
-
-  // Only relay-owned output waits for client reconnect (#3522).
   if (approvedDecisions.length > 0 && !processOwnedTurn && !isDeliveryReady()) {
     const transportOpenResult = await waitForTransportOpen(
       isDeliveryReady,
@@ -668,7 +672,6 @@ export async function handleApprovalStop(params: {
     return interruptTermination();
   }
 
-  // Broadcast file writes to all windows.
   const onFileWrite = (filePath: string, content: string) => {
     if (!runtime.turnLifecycle.isCurrent(turnLease) || !authorityGuard())
       return;
@@ -699,7 +702,7 @@ export async function handleApprovalStop(params: {
     if (shouldInterrupt()) {
       return interruptTermination();
     }
-    executionResults = await executeApprovals(decisions, undefined, {
+    executionResults = await executeApprovals(decisions, params.onChunk, {
       toolContextId: turnToolContextId ?? undefined,
       abortSignal,
       onStreamingOutput: emitToolExecutionOutput,
@@ -711,8 +714,7 @@ export async function handleApprovalStop(params: {
       afterToolExecution: effectBoundary.afterToolExecution,
     });
   } catch (error) {
-    // Persist partial results and fail unknown outcomes before delivery waits;
-    // recovery must never execute committed effects again.
+    // Persist partial results before delivery waits; recovery never replays effects.
     const boundaryResults = effectBoundary.results;
     const failureResults = [
       ...boundaryResults,
@@ -732,8 +734,7 @@ export async function handleApprovalStop(params: {
       "after_tool_execution",
     );
 
-    // Close tool-start events after execution throws. Cancellation retains
-    // precedence because its cached interrupted results own terminal delivery.
+    // Close tool starts after throws; cancellation still owns terminal delivery.
     emitToolExecutionOutput.flush();
     if (!shouldInterrupt() && !processOwnedTurn && !isDeliveryReady()) {
       await waitForTransportOpen(isDeliveryReady, shouldInterrupt);
@@ -873,7 +874,7 @@ export async function handleApprovalStop(params: {
   const consumedQueuedTurn =
     params.allowQueuedContinuation === false
       ? null
-      : consumeQueuedTurn(runtime, params.activeOriginatorScope ?? null);
+      : consumeQueuedTurn(runtime);
   if (consumedQueuedTurn) {
     const { dequeuedBatch, queuedTurn } = consumedQueuedTurn;
     await params.onConsumeQueuedTurn?.(queuedTurn);
@@ -930,6 +931,7 @@ export async function handleApprovalStop(params: {
     if (shouldInterrupt()) {
       return interruptTermination(nextTurnInput, continuationBatchId);
     }
+    params.onContinuationSendError?.(interruptTermination());
     throw error;
   }
   if (sendResult.kind === "terminal") {
@@ -977,7 +979,6 @@ export async function handleApprovalStop(params: {
     agent_id: agentId,
     conversation_id: conversationId,
   });
-
   runtime.turnLifecycle.setExecutingToolCallIds(turnLease, []);
   emitRuntimeStateUpdates(runtime, {
     agent_id: agentId,

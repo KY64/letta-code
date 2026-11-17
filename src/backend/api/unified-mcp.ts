@@ -18,7 +18,8 @@ export interface UnifiedMcpClient {
  */
 const MCP_ORIGINATOR_TOKEN_HEADER = "x-letta-mcp-originator-token";
 // Compatibility negotiation, not principal authority. Emitted by the same
-// process that holds the bearer and isolates listener queues by originator.
+// process that holds the bearer and withholds it from any turn that mixes
+// inputs from different super runs (queued inputs still steer that turn).
 const MCP_ORIGINATOR_ISOLATION_HEADER = "x-letta-mcp-originator-isolation";
 
 export interface UnifiedMcpServer {
@@ -29,6 +30,7 @@ export interface UnifiedMcpServer {
   command?: string;
   args?: string[];
   serverUrl?: string;
+  cachedNumTools?: number | null;
 }
 
 export interface UnifiedMcpTool {
@@ -110,6 +112,10 @@ function parseServer(
     serverName,
     serverType,
     target,
+    ...(typeof value.cached_num_tools === "number" ||
+    value.cached_num_tools === null
+      ? { cachedNumTools: value.cached_num_tools }
+      : {}),
     ...(serverUrl ? { serverUrl } : {}),
     ...(command ? { command, args } : {}),
   };

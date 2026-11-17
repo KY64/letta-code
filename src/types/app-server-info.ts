@@ -29,11 +29,13 @@ export interface AppServerInfoResponseMessage {
     subagent_message?: boolean;
     runtime_workspace_sandbox?: boolean;
     runtime_external_tools_update?: boolean;
+    /** `runtime_start` and `runtime_external_tools_update` accept `tool_policy`. */
+    runtime_tool_policy?: boolean;
+    /** `tool_policy` accepts `foreground_yield_ms`. */
+    runtime_tool_policy_foreground_yield?: boolean;
     structured_outputs?: boolean;
     /** `write_file` accepts `encoding: "base64"`, `append`, and `move_to`. */
     write_file_base64?: boolean;
-    /** Queue scope partitioning support; not a security attestation. */
-    mcp_originator_queue_isolation?: boolean;
     split_channels: boolean;
   };
 }
@@ -85,8 +87,6 @@ export function isAppServerInfoResponseMessage(
       typeof capabilityRecord.structured_outputs === "boolean") &&
     (capabilityRecord.write_file_base64 === undefined ||
       typeof capabilityRecord.write_file_base64 === "boolean") &&
-    (capabilityRecord.mcp_originator_queue_isolation === undefined ||
-      typeof capabilityRecord.mcp_originator_queue_isolation === "boolean") &&
     typeof capabilityRecord.split_channels === "boolean"
   );
 }

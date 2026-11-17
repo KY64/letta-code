@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, unlink, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { removeTestDir } from "@/test-utils/test-fs";
 import {
   acquireManualListenerLock,
+  getManualListenerLockRoot,
   getManualListenerScopeHash,
   ManualListenerAlreadyRunningError,
   type ManualListenerLockScope,
@@ -21,14 +23,27 @@ const SCOPE: ManualListenerLockScope = {
 describe("manual listener instance lock", () => {
   let lockRoot: string;
   let alivePids: Set<number>;
+  let processStartTimes: Map<number, string>;
 
   beforeEach(async () => {
     lockRoot = await mkdtemp(path.join(tmpdir(), "letta-listener-lock-"));
     alivePids = new Set();
+    processStartTimes = new Map();
   });
 
   afterEach(async () => {
-    await rm(lockRoot, { recursive: true, force: true });
+    await removeTestDir(lockRoot);
+  });
+
+  test("uses the product config root for default lock ownership", () => {
+    const originalConfigDir = process.env.LETTA_CONFIG_DIR;
+    process.env.LETTA_CONFIG_DIR = path.join(lockRoot, ".dream");
+    try {
+      expect(getManualListenerLockRoot()).toBe(path.join(lockRoot, ".dream"));
+    } finally {
+      if (originalConfigDir === undefined) delete process.env.LETTA_CONFIG_DIR;
+      else process.env.LETTA_CONFIG_DIR = originalConfigDir;
+    }
   });
 
   function acquire(
@@ -37,11 +52,14 @@ describe("manual listener instance lock", () => {
     ownerToken: string,
   ) {
     alivePids.add(processId);
+    processStartTimes.set(processId, `started-${ownerToken}`);
     return acquireManualListenerLock(scope, {
       lockRoot,
       processId,
       ownerToken,
       isProcessAlive: (pid) => alivePids.has(pid),
+      getOwnProcessStartTime: async () => `started-${ownerToken}`,
+      getProcessStartTime: async (pid) => processStartTimes.get(pid) ?? null,
     });
   }
 
@@ -133,6 +151,84 @@ describe("manual listener instance lock", () => {
     await replacement.release();
   });
 
+  test("reclaims a same-boot pid reused by another process", async () => {
+    const stale = await acquire(SCOPE, 101, "owner-stale");
+    processStartTimes.set(101, "started-unrelated");
+
+    const replacement = await acquire(SCOPE, 202, "owner-replacement");
+    const record = JSON.parse(await readFile(replacement.lockPath, "utf-8"));
+    expect(record.pid).toBe(202);
+    expect(record.started).toBe("started-owner-replacement");
+    await stale.release();
+    await replacement.release();
+  });
+
+  test("keeps the lock when the pid's start time matches", async () => {
+    const incumbent = await acquire(SCOPE, 101, "owner-incumbent");
+    await expect(acquire(SCOPE, 202, "owner-second")).rejects.toBeInstanceOf(
+      ManualListenerAlreadyRunningError,
+    );
+    await incumbent.release();
+  });
+
+  test("keeps the lock when the pid's start time cannot be read", async () => {
+    const incumbent = await acquire(SCOPE, 101, "owner-incumbent");
+    processStartTimes.delete(101);
+    await expect(acquire(SCOPE, 202, "owner-second")).rejects.toBeInstanceOf(
+      ManualListenerAlreadyRunningError,
+    );
+    await incumbent.release();
+  });
+
+  test("reclaims a pre-boot lock only when its live pid is not letta", async () => {
+    await acquireManualListenerLock(SCOPE, {
+      lockRoot,
+      processId: 101,
+      ownerToken: "owner-pre-reboot",
+      isProcessAlive: () => true,
+      getOwnProcessStartTime: async () => null,
+    });
+    const acquireWith = (
+      processId: number,
+      bootTimeMs: number,
+      command: string | null,
+    ) =>
+      acquireManualListenerLock(SCOPE, {
+        lockRoot,
+        processId,
+        ownerToken: `owner-${processId}`,
+        isProcessAlive: () => true,
+        bootTimeMs,
+        getProcessCommand: () => command,
+        getOwnProcessStartTime: async () => null,
+        getProcessStartTime: async () => {
+          throw new Error("legacy locks must not look up process start time");
+        },
+      });
+    const beforeLock = Date.now() - 3_600_000;
+    const afterLock = Date.now() + 3_600_000;
+
+    // Same boot: the live incumbent still blocks.
+    await expect(
+      acquireWith(202, beforeLock, "/usr/libexec/unrelated"),
+    ).rejects.toBeInstanceOf(ManualListenerAlreadyRunningError);
+    // Looks pre-boot (e.g. clock jump) but the pid is still a letta server.
+    await expect(
+      acquireWith(202, afterLock, "node /usr/local/bin/letta server"),
+    ).rejects.toBeInstanceOf(ManualListenerAlreadyRunningError);
+
+    // After a reboot, pid 101 belongs to an unrelated process.
+    const replacement = await acquireWith(
+      303,
+      afterLock,
+      "/System/Library/PrivateFrameworks/CloudDocsDaemon.framework/bird",
+    );
+    const record = JSON.parse(await readFile(replacement.lockPath, "utf-8"));
+    expect(record.pid).toBe(303);
+    expect(record.started).toBeUndefined();
+    await replacement.release();
+  });
+
   test("fails closed on a corrupt incumbent record", async () => {
     const scopeHash = getManualListenerScopeHash(SCOPE);
     const listenersDir = path.join(lockRoot, "listeners");
@@ -141,6 +237,7 @@ describe("manual listener instance lock", () => {
       processId: 101,
       ownerToken: "owner-initial",
       isProcessAlive: () => true,
+      getOwnProcessStartTime: async () => null,
     }).then(async (handle) => {
       await unlink(handle.lockPath);
       await writeFile(handle.lockPath, "not-json", "utf-8");
@@ -167,6 +264,7 @@ describe("manual listener instance lock", () => {
         processId: 101,
         ownerToken: "owner-101",
         isProcessAlive: () => false,
+        getOwnProcessStartTime: async () => null,
       }),
     ).rejects.toBeInstanceOf(ManualListenerLockUnavailableError);
   });

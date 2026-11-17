@@ -53,7 +53,7 @@ import {
   getIntendedCronOccurrence,
 } from "./prompt";
 import { safeAppendCronRunLogForTask } from "./run-log";
-import { isManagedCloudSandbox } from "./runner";
+import { getLocalCronExecutionError } from "./runner";
 import { SCHEDULE_ORIGIN_TAG } from "./scheduled-task-prompt";
 
 export {
@@ -133,6 +133,14 @@ const GC_INTERVAL_MS = 60 * 60_000; // 1 hour
 const TOMBSTONE_HEARTBEAT_MS = 1_000;
 const LEASE_RETRY_MS = 30_000; // 30 seconds between lease claim retries
 const MAX_LEASE_RETRIES = 3;
+const SLOW_LEASE_RETRY_MS = 5 * 60_000; // after fast retries, keep trying quietly
+
+let slowLeaseRetryTimer: ReturnType<typeof setInterval> | null = null;
+
+function clearSlowLeaseRetry(): void {
+  if (slowLeaseRetryTimer) clearInterval(slowLeaseRetryTimer);
+  slowLeaseRetryTimer = null;
+}
 const NEW_CONVERSATION_TARGET = "new";
 
 // ── Helpers ─────────────────────────────────────────────────────────
@@ -503,11 +511,12 @@ export async function runCronTaskNow(taskId: string): Promise<{
   task?: CronTask;
   error?: string;
 }> {
-  if (isManagedCloudSandbox()) {
+  const executionError = getLocalCronExecutionError();
+  if (executionError) {
     return {
       success: false,
       found: false,
-      error: "Local schedules cannot run in a managed Cloud sandbox",
+      error: executionError,
     };
   }
 
@@ -688,8 +697,9 @@ function tick(
  *
  * If the lease claim fails (e.g. another process briefly holds it after a
  * crash/restart), the scheduler will retry up to MAX_LEASE_RETRIES times
- * with LEASE_RETRY_MS between attempts. The user is warned that cron
- * tasks won't fire until the scheduler starts.
+ * with LEASE_RETRY_MS between attempts, then every SLOW_LEASE_RETRY_MS until
+ * the lease frees. The user is warned that cron tasks won't fire until the
+ * scheduler starts.
  */
 export function startScheduler(
   socket: ListenerTransport,
@@ -697,7 +707,7 @@ export function startScheduler(
   processQueuedTurn: ProcessQueuedTurn,
   _retryCount = 0,
 ): void {
-  if (isManagedCloudSandbox()) {
+  if (getLocalCronExecutionError()) {
     return;
   }
 
@@ -712,6 +722,8 @@ export function startScheduler(
   try {
     token = claimSchedulerLease(scope);
   } catch (err) {
+    // Slow retry is already armed: stay quiet until the lease frees.
+    if (slowLeaseRetryTimer) return;
     if (_retryCount < MAX_LEASE_RETRIES) {
       logScheduler(
         opts,
@@ -732,10 +744,29 @@ export function startScheduler(
       );
       logScheduler(
         opts,
-        "Another process may hold the lease. Restart Letta Code to retry.",
+        `Another process may hold the lease. Retrying every ${SLOW_LEASE_RETRY_MS / 60_000} minutes.`,
       );
+      slowLeaseRetryTimer = setInterval(() => {
+        const ctx = listenerFireContext;
+        if (!ctx || schedulerState) {
+          clearSlowLeaseRetry();
+          return;
+        }
+        startScheduler(
+          ctx.socket,
+          ctx.opts,
+          ctx.processQueuedTurn,
+          _retryCount,
+        );
+      }, SLOW_LEASE_RETRY_MS);
+      slowLeaseRetryTimer.unref?.();
     }
     return;
+  }
+
+  if (slowLeaseRetryTimer) {
+    clearSlowLeaseRetry();
+    logScheduler(opts, "Claimed scheduler lease on slow retry.");
   }
 
   const now = new Date();
@@ -805,6 +836,7 @@ export function startScheduler(
  */
 export function stopScheduler(): void {
   listenerFireContext = null;
+  clearSlowLeaseRetry();
   if (!schedulerState) return;
 
   clearInterval(schedulerState.tickInterval);

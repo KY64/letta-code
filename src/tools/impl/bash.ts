@@ -4,6 +4,7 @@ import {
   consumeWorkingDirectoryRecovery,
   getCurrentWorkingDirectory,
 } from "@/runtime-context";
+import { resolveForegroundYieldMs } from "@/tools/foreground-yield";
 import {
   captureSecretRedactions,
   createSecretStreamScrubber,
@@ -30,9 +31,14 @@ import {
   backgroundProcesses,
   createBackgroundOutputFile,
   getNextBashId,
+  notifyBackgroundProcessStateChanged,
   scheduleBackgroundProcessCleanup,
   scrubCompletedBackgroundOutput,
 } from "./process_manager.js";
+import {
+  findSelfMatchingPgrepPattern,
+  selfMatchingPgrepMessage,
+} from "./self-matching-pgrep.js";
 import { getShellEnv } from "./shell-env.js";
 import {
   buildShellLaunchers,
@@ -52,8 +58,15 @@ import { assertSafeWindowsCommand } from "./windows-command-safety.js";
 // Cache the working shell launcher after first successful spawn
 let cachedWorkingLauncher: string[] | null = null;
 
-/** Time to wait for an ordinary Bash command before returning it as a task. */
-const DEFAULT_FOREGROUND_YIELD_MS = 10_000;
+type ShellProcessStarter = typeof startShellProcess;
+let shellProcessStarter: ShellProcessStarter = startShellProcess;
+
+/** Test-only override for observing shell process launch options. */
+export function __setShellProcessStarterForTests(
+  starter: ShellProcessStarter | null,
+): void {
+  shellProcessStarter = starter ?? startShellProcess;
+}
 
 function rebuildCachedLauncher(
   command: string,
@@ -311,6 +324,7 @@ interface BashArgs {
   signal?: AbortSignal;
   onOutput?: (chunk: string, stream: "stdout" | "stderr") => void;
   secretEnv?: Record<string, string>;
+  variableEnv?: Record<string, string>;
   parentScope?: { agentId: string; conversationId: string };
   /** Test-only override; not exposed in the Bash tool schema. */
   foregroundYieldMs?: number;
@@ -328,15 +342,16 @@ export async function bash(args: BashArgs): Promise<BashResult> {
   validateRequiredParams(args, ["command"], "Bash");
   const {
     command,
-    timeout = 120000,
+    timeout,
     description,
     run_in_background = false,
     signal,
     onOutput,
-    secretEnv,
+    secretEnv: invocationSecrets,
     parentScope,
-    foregroundYieldMs = DEFAULT_FOREGROUND_YIELD_MS,
+    foregroundYieldMs = resolveForegroundYieldMs(),
   } = args;
+  const secretEnv = { ...args.variableEnv, ...invocationSecrets };
   const userCwd = getCurrentWorkingDirectory();
   assertSafeWindowsCommand(command, {
     cwd: userCwd,
@@ -344,7 +359,7 @@ export async function bash(args: BashArgs): Promise<BashResult> {
   });
   const redactions = captureSecretRedactions(
     parentScope?.agentId,
-    secretEnv ?? {},
+    invocationSecrets ?? {},
   );
   const sanitizeOutput = (text: string) =>
     scrubSecretsFromString(text, redactions);
@@ -380,6 +395,16 @@ export async function bash(args: BashArgs): Promise<BashResult> {
   if (!run_in_background && commandRunsForegroundSleep(command)) {
     return {
       content: [{ type: "text", text: FOREGROUND_SLEEP_BLOCKED_MESSAGE }],
+      status: "error",
+    };
+  }
+
+  const selfMatchingPattern = findSelfMatchingPgrepPattern(command);
+  if (selfMatchingPattern !== null) {
+    return {
+      content: [
+        { type: "text", text: selfMatchingPgrepMessage(selfMatchingPattern) },
+      ],
       status: "error",
     };
   }
@@ -426,11 +451,13 @@ export async function bash(args: BashArgs): Promise<BashResult> {
   let outputWriteFailed = false;
   const foregroundOutput = { stdout: "", stderr: "" };
   const effectiveTimeout = run_in_background
-    ? timeout > 0
+    ? timeout !== undefined && timeout > 0
       ? timeout
       : 0
-    : Math.min(Math.max(timeout, 1), 600000);
-  const runningProcess = startShellProcess(sandboxed.launcher, {
+    : timeout === undefined
+      ? 0
+      : Math.min(Math.max(timeout, 1), 600000);
+  const runningProcess = shellProcessStarter(sandboxed.launcher, {
     cwd: userCwd,
     env: sandboxed.env,
     timeoutMs: effectiveTimeout,
@@ -467,6 +494,8 @@ export async function bash(args: BashArgs): Promise<BashResult> {
   });
   bgProcess = {
     process: runningProcess.process,
+    completion: runningProcess.completion,
+    terminate: runningProcess.terminate,
     command,
     stdout: [],
     stderr: [],
@@ -524,14 +553,16 @@ export async function bash(args: BashArgs): Promise<BashResult> {
       flushStreamScrubbers();
       const err = error as Error & { killed?: boolean };
       const message = sanitizeOutput(
-        err.killed ? `Command timed out after ${timeout}ms` : err.message,
+        err.killed
+          ? `Command timed out after ${effectiveTimeout}ms`
+          : err.message,
       );
       bgProcess.status = "failed";
       appendBackgroundProcessOutput(bgProcess, "stderr", message);
       appendToOutputFile(
         outputFile,
         err.killed
-          ? `\n[timeout after ${timeout}ms]\n`
+          ? `\n[timeout after ${effectiveTimeout}ms]\n`
           : `\n[error] ${message}\n`,
       );
       scrubCompletedBackgroundOutput(bgProcess);
@@ -554,6 +585,15 @@ export async function bash(args: BashArgs): Promise<BashResult> {
         status,
         detail,
       });
+      // The queue frame is emitted in a microtask. Publish completion after
+      // that frame so zero running shells cannot overtake the notification.
+      if (bgProcess.completionNotificationSuppressed) {
+        notifyBackgroundProcessStateChanged(bgProcess.runtimeScope);
+      } else {
+        queueMicrotask(() =>
+          notifyBackgroundProcessStateChanged(bgProcess.runtimeScope),
+        );
+      }
       scheduleBackgroundProcessCleanup(bashId);
     });
   };

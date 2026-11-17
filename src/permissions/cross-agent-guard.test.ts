@@ -8,7 +8,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, parse } from "node:path";
+import { dirname, join, parse } from "node:path";
 
 import { checkPermission } from "@/permissions/checker";
 import { cliPermissions } from "@/permissions/cli-permissions-instance";
@@ -43,12 +43,14 @@ function thirdMemory(rel = ""): string {
 }
 
 const ENV_KEYS_TO_RESET = [
+  "HOME",
   "AGENT_ID",
   "LETTA_AGENT_ID",
   "LETTA_PARENT_AGENT_ID",
   "LETTA_CODE_AGENT_ROLE",
   "MEMORY_DIR",
   "LETTA_MEMORY_DIR",
+  "LETTA_CONFIG_DIR",
   "LETTA_LOCAL_BACKEND_DIR",
   SANDBOX_ENV_VAR,
 ] as const;
@@ -281,6 +283,33 @@ describe("evaluateCrossAgentGuard", () => {
       "/tmp",
     );
     expect(result).toBeNull();
+  });
+
+  test("expands environment variables before checking memory paths", () => {
+    const tempHome = mkdtempSync(join(tmpdir(), "memory-guard-home-"));
+    const env = {
+      ...process.env,
+      HOME: tempHome,
+      AGENT_ID: SELF,
+      MEMORY_DIR: join(tempHome, ".letta", "agents", SELF, "memory"),
+    };
+    try {
+      const cases = [
+        [`\${HOME}/.letta/agents/${OTHER}/memory/x.md`, true],
+        [`$MEMORY_DIR/../../${OTHER}/memory/x.md`, true],
+        [`\${HOME}/.letta/agents/${SELF}/memory/x.md`, false],
+      ] as const;
+      for (const [filePath, denied] of cases) {
+        expect(
+          evaluateCrossAgentGuard("Read", { file_path: filePath }, tempHome, {
+            env,
+            currentAgentId: SELF,
+          }) !== null,
+        ).toBe(denied);
+      }
+    } finally {
+      rmSync(tempHome, { recursive: true, force: true });
+    }
   });
 
   test("returns null for non-agent paths", () => {
@@ -630,6 +659,31 @@ describe("symlink-escape (realpath classification of in-process file tools)", ()
   function agentMemory(home: string, id: string, rel = ""): string {
     return join(home, ".letta", "agents", id, "memory", rel);
   }
+
+  test("a product override keeps both product and legacy agents trees guarded", () => {
+    const home = makeTempHome();
+    const productRoot = join(home, ".dream");
+    const env = {
+      HOME: home,
+      LETTA_CONFIG_DIR: productRoot,
+      AGENT_ID: SELF,
+    } as NodeJS.ProcessEnv;
+
+    for (const configRoot of [productRoot, join(home, ".letta")]) {
+      const target = join(configRoot, "agents", OTHER, "memory", "secret.md");
+      mkdirSync(dirname(target), { recursive: true });
+      writeFileSync(target, "TOPSECRET");
+
+      const result = evaluateCrossAgentGuard(
+        "Read",
+        { file_path: target },
+        home,
+        { env, currentAgentId: SELF, disableMemoryGuard: false },
+      );
+
+      expect(result?.offendingAgentIds).toContain(OTHER);
+    }
+  });
 
   afterEach(() => {
     while (tempHomes.length) {

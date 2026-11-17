@@ -58,7 +58,7 @@ export interface StartListenerOptions {
     connection: ListenerConnectionState,
   ) => void | Promise<void>;
   onDisconnected: () => void;
-  onNeedsReregister?: (replacement: ListenerClientReplacement) => void;
+  onNeedsReregister?: (replacement?: ListenerClientReplacement) => void;
   /** Explicit state lineage supplied only by onNeedsReregister. */
   replacement?: ListenerClientReplacement;
   onError: (error: Error) => void;
@@ -92,6 +92,8 @@ export type SyncReplayOptions = {
 };
 
 export interface IncomingMessage {
+  /** Epoch milliseconds when this input arrived at the listener. */
+  receivedAt?: number;
   type: "message";
   /**
    * Transport connection that delivered this message. Queueing carries this
@@ -118,7 +120,6 @@ export interface IncomingMessage {
   clientToolAllowlist?: string[];
   clientToolset?: ClientToolsetConfig;
   clientPreferences?: import("@/types/client-preferences").ClientPreferences;
-  externalToolScopeIds?: string[];
   /** Exclude interactive user-input tools (AskUserQuestion) from this turn's toolset. */
   excludeInteractiveTools?: boolean;
   responseFormat?: Record<string, unknown>;
@@ -183,7 +184,13 @@ export type ListenerStreamObserver = (
 ) => void;
 
 export interface PendingExternalToolCall {
+  /** Captures the owning lease before awaiting the remote response. */
+  isOwningTurnCurrent?: () => boolean;
   connectionId: ListenerConnectionId;
+  /** Serialized request, resent if the socket drops before a response. */
+  requestFrame: string;
+  /** Transport that last carried `requestFrame`. */
+  sentOn: ListenerTransport;
   resolve: (result: ExternalToolCallResult) => void;
   reject: (error: Error) => void;
   timeout: ReturnType<typeof setTimeout>;
@@ -291,10 +298,14 @@ export type DurablePreparedInputTerminal = {
   preparedAt?: number;
   /** Durable monotonic order used to reconcile legacy retired authority. */
   preparationSequence?: number;
+  /** Canonical journal aliases stamped when restart promotion completes. */
+  inputDispositionKeys?: string[];
   /** Durable claim that orders this publication before later quarantine. */
   publicationClaimed?: true;
   /** Persist a crash proof even when no external terminal consumer exists. */
   persistWithoutConsumers?: true;
+  /** Consumers moved to a teleport continuation; source proof stays private. */
+  suppressConsumerPublication?: true;
   scope: { agentId: string | null; conversationId: string };
   message: {
     type: "turn_finished";
@@ -324,6 +335,7 @@ export type DurablePreparedInputTerminal = {
 export type InterruptedTerminalAuthority = {
   interruptedRevision: string;
   authorityRevision: string;
+  recoveryAuthorityBaseRevision?: string;
   recoveryLineageId?: string;
   terminalIdentity?: string;
   preparationSequence?: number;
@@ -720,6 +732,8 @@ export type ListenerRuntime = {
   _unsubscribeSubagentStreamEvents?: (() => void) | undefined;
   /** Unsubscribe from background process state (set on socket open, cleared on close). */
   _unsubscribeBackgroundProcessState?: (() => void) | undefined;
+  /** Stop the sandbox disk watcher (set with process services, cleared with them). */
+  _stopDiskSpaceWatch?: (() => void) | undefined;
 };
 
 export interface InterruptPopulateInput {
@@ -729,6 +743,7 @@ export interface InterruptPopulateInput {
   agentId: string | null;
   conversationId: string;
   requestOtid?: string;
+  denialReason?: string;
 }
 
 export interface InterruptToolReturn {
@@ -740,3 +755,25 @@ export interface InterruptToolReturn {
 }
 
 export type { DequeuedBatch, QueueBlockedReason, QueueItem };
+
+export type ConnectedListenerOptions = Pick<
+  StartListenerOptions,
+  | "connectionId"
+  | "onConnected"
+  | "onLog"
+  | "onConnectionReady"
+  | "onStatusChange"
+  | "onWsEvent"
+>;
+
+export interface ConnectedListenerRuntimeOptions {
+  /** Disable for startup tests using transports without WebSocket events. */
+  startStartupDeadline?: boolean;
+  startHeartbeat?: boolean;
+  startCronScheduler?: boolean;
+  startProcessServices?: boolean;
+  streamTransport?: ListenerTransport | null;
+  emitInitialState?: boolean;
+  updateReconnectState?: boolean;
+  activateIngress?: () => Promise<boolean>;
+}

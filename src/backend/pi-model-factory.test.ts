@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
@@ -44,6 +44,37 @@ async function withEnv<T>(
 describe("pi model factory", () => {
   afterEach(() => {
     clearRegisteredPiProviders();
+  });
+
+  test("rejects a legacy stored key without leaking it", async () => {
+    const storageDir = await mkdtemp(join(tmpdir(), "pi-invalid-key-"));
+    const badKey = "secret\r\nnotification";
+    try {
+      await createOrUpdateLocalProvider({
+        storageDir,
+        providerType: "openai",
+        providerName: "openai",
+        apiKey: "valid-key",
+      });
+      const authPath = join(storageDir, "providers", "auth.json");
+      const file = JSON.parse(await readFile(authPath, "utf8"));
+      file.providers.openai.auth.key = badKey;
+      await writeFile(authPath, JSON.stringify(file));
+      const result = resolvePiModelForAgent(
+        "openai/gpt-4o",
+        {},
+        { localProviderAuthStorageDir: storageDir },
+      );
+      await expect(result).rejects.toThrow(
+        "API key for openai is not a valid header value. Reconnect this provider with /connect.",
+      );
+      await result.catch((error: Error) => {
+        expect(error.message).not.toContain(badKey);
+        expect(error.message).not.toContain("secret");
+      });
+    } finally {
+      await rm(storageDir, { recursive: true, force: true });
+    }
   });
 
   test("defaults always-on zAI GLM models to a valid thinking level", () => {
@@ -259,6 +290,70 @@ describe("pi model factory", () => {
         expect(resolved.apiKey).toBeUndefined();
       },
     );
+  });
+
+  test("moves the saved Kimi built-in URL to Chat Completions and keeps custom URLs", async () => {
+    const storageDir = await mkdtemp(join(tmpdir(), "pi-kimi-url-"));
+    try {
+      await createOrUpdateLocalProvider({
+        storageDir,
+        providerType: "moonshot_coding",
+        providerName: "lc-kimi-code",
+        apiKey: "test-key",
+        baseURL: "https://api.kimi.com/coding",
+      });
+      const old = await resolvePiModelForAgent(
+        "moonshot_coding/kimi-for-coding",
+        { provider_type: "moonshot_coding" },
+        { localProviderAuthStorageDir: storageDir },
+      );
+      expect(old.model).toMatchObject({
+        api: "openai-completions",
+        baseUrl: "https://api.kimi.com/coding/v1",
+      });
+
+      await createOrUpdateLocalProvider({
+        storageDir,
+        providerType: "moonshot_coding",
+        providerName: "lc-kimi-code",
+        apiKey: "test-key",
+        baseURL: "https://proxy.example.test/kimi/v1",
+      });
+      const custom = await resolvePiModelForAgent(
+        "moonshot_coding/kimi-for-coding",
+        { provider_type: "moonshot_coding" },
+        { localProviderAuthStorageDir: storageDir },
+      );
+      expect(custom.model.baseUrl).toBe("https://proxy.example.test/kimi/v1");
+    } finally {
+      await rm(storageDir, { recursive: true, force: true });
+    }
+  });
+
+  test("legacy Azure handle and credential resolve to canonical provider", async () => {
+    const storageDir = await mkdtemp(join(tmpdir(), "pi-azure-alias-"));
+    try {
+      await createOrUpdateLocalProvider({
+        storageDir,
+        providerType: "azure-openai-responses",
+        providerName: "azure-openai-responses",
+        apiKey: "test-key",
+      });
+      const resolved = await resolvePiModelForAgent(
+        "azure-openai-responses/gpt-4.1",
+        { provider_type: "azure-openai-responses" },
+        { localProviderAuthStorageDir: storageDir },
+      );
+      expect(resolved.provider).toBe("azure");
+      expect(resolved.apiKey).toBe("test-key");
+      expect(resolved.model).toMatchObject({
+        api: "azure-openai-responses",
+        provider: "azure",
+        id: "gpt-4.1",
+      });
+    } finally {
+      await rm(storageDir, { recursive: true, force: true });
+    }
   });
 
   test("resolves ChatGPT OAuth through pi OAuth credentials", async () => {

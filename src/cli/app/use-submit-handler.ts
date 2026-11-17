@@ -118,11 +118,7 @@ import type {
   ModConversationCloseReason,
 } from "@/cli/mods/types";
 import type { LocalModAdapter } from "@/cli/mods/use-local-mod-adapter";
-import {
-  DEFAULT_SUMMARIZATION_MODEL,
-  SYSTEM_REMINDER_CLOSE,
-  SYSTEM_REMINDER_OPEN,
-} from "@/constants";
+import { SYSTEM_REMINDER_CLOSE, SYSTEM_REMINDER_OPEN } from "@/constants";
 import { experimentManager } from "@/experiments/manager";
 import {
   runPreCompactHooks,
@@ -137,7 +133,6 @@ import {
 } from "@/reminders/engine";
 import { runPostTurnMemorySync } from "@/reminders/memory-git-sync";
 import {
-  enqueueMemoryGitSyncReminder,
   markPostCompactionContextRemindersPending,
   markSecretsInfoReminderPending,
   type SharedReminderState,
@@ -2122,7 +2117,8 @@ export function useSubmitHandler(ctx: SubmitHandlerContext) {
                     mode: modeArg,
                     model:
                       agentStateRef.current?.compaction_settings?.model?.trim() ||
-                      DEFAULT_SUMMARIZATION_MODEL,
+                      agentStateRef.current?.model ||
+                      undefined,
                   },
                 }
               : undefined;
@@ -3743,11 +3739,6 @@ ${SYSTEM_REMINDER_CLOSE}
         conversationId,
         agentId,
         isEnabled: isActiveMemfsEnabled,
-        enqueueReminder: (text) => {
-          enqueueMemoryGitSyncReminder(sharedReminderStateRef.current, {
-            text,
-          });
-        },
       });
 
       // Clean up placeholders after submission

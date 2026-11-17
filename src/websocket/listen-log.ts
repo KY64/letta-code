@@ -18,15 +18,16 @@ import {
   readdirSync,
   unlinkSync,
 } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
+import { resolveGlobalConfigDir } from "@/utils/settings-path";
 import { redactWsEventForLogging } from "./ws-event-redaction";
 
-const REMOTE_LOG_DIR = join(homedir(), ".letta", "logs", "remote");
+const REMOTE_LOG_DIR = join(resolveGlobalConfigDir(), "logs", "remote");
 const MAX_LOG_FILES = 10;
 const MAX_LOG_BYTES = 10 * 1024 * 1024; // 10 MB per session file
 
-function formatTimestamp(): string {
+/** Local wall-clock time as `HH:MM:SS.mmm` for listener logs. */
+export function formatTimestamp(): string {
   const now = new Date();
   const h = String(now.getHours()).padStart(2, "0");
   const m = String(now.getMinutes()).padStart(2, "0");

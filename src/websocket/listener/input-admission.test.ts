@@ -1,8 +1,12 @@
 import { afterEach, expect, mock, test } from "bun:test";
+import { mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type WebSocket from "ws";
 import {
   markListenerConnectionInitialized,
   openListenerConnection,
+  subscribeListenerConnection,
 } from "./connection";
 import {
   getOrCreateScopedRuntime,
@@ -10,9 +14,12 @@ import {
 } from "./conversation-runtime";
 import { dispatchInboundMessageWhenReady } from "./inbound-dispatch";
 import {
+  createAcceptedInputDispositionLedger,
   getInputDisposition,
+  MAX_INPUT_DISPOSITION_STORE_BYTES,
   ordinaryInputIdentity,
   rememberInputDisposition,
+  reserveInputDisposition,
   teleportInputIdentity,
 } from "./input-disposition";
 import { createRuntime } from "./lifecycle";
@@ -23,6 +30,7 @@ import type {
   IncomingMessage,
   ListenerRuntime,
   PendingTeleport,
+  ProcessQueuedTurn,
   StartListenerOptions,
 } from "./types";
 
@@ -115,6 +123,7 @@ function setupRouter(params: {
     context: string,
   ) => void;
   processIncomingMessage: (incoming: IncomingMessage) => Promise<void>;
+  processQueuedTurn?: ProcessQueuedTurn;
 }): (data: WebSocket.RawData) => Promise<void> {
   const options = makeOptions();
   const connection = openListenerConnection({
@@ -133,7 +142,7 @@ function setupRouter(params: {
     runtime: params.listener,
     socket: socket as unknown as WebSocket,
     opts: options,
-    processQueuedTurn: async () => {},
+    processQueuedTurn: params.processQueuedTurn ?? (async () => {}),
     fileCommandSession: { handle: () => false },
     getParsedRuntimeScope: () => null,
     replaySyncStateForRuntime: async () => {},
@@ -194,7 +203,7 @@ function teleportContinueFrame(requestId: string, teleportId: string): Buffer {
 
 afterEach(() => setActiveRuntime(null));
 
-test("direct started input remains refill-suppressed until turn ownership", async () => {
+test("dequeued input remains refill-suppressed until turn ownership", async () => {
   const listener = createRuntime();
   const runtime = getOrCreateScopedRuntime(
     listener,
@@ -208,28 +217,36 @@ test("direct started input remains refill-suppressed until turn ownership", asyn
     release = resolve;
   });
   let started = false;
-  let directBatchId: string | undefined;
+  let dequeuedBatchId: string | undefined;
   const handleMessage = setupRouter({
     listener,
     runtime,
     sent,
     tasks,
     trackListenerError: () => {},
-    processIncomingMessage: (async (...args: unknown[]) => {
-      directBatchId = args[5] as string | undefined;
+    processIncomingMessage: async () => {
+      throw new Error("content must go through the queue");
+    },
+    processQueuedTurn: async (_incoming, batch) => {
+      dequeuedBatchId = batch.batchId;
       started = true;
       await held;
-    }) as never,
+      runtime.dequeuedInputIdentitiesByBatchId.delete(batch.batchId);
+    },
   });
 
+  subscribeListenerConnection(listener, "conn-admission", {
+    agent_id: "agent-1",
+    conversation_id: "conversation-1",
+  });
   await handleMessage(createMessageFrame("direct", "cm-direct-started"));
   for (let attempt = 0; !started && attempt < 100; attempt += 1) {
     await Bun.sleep(1);
   }
   expect(started).toBe(true);
-  expect(directBatchId).toStartWith("batch-direct-");
+  expect(dequeuedBatchId).toBeDefined();
   expect(
-    runtime.dequeuedInputIdentitiesByBatchId.get(directBatchId ?? ""),
+    runtime.dequeuedInputIdentitiesByBatchId.get(dequeuedBatchId ?? ""),
   ).toEqual([{ domain: "input", id: "cm-direct-started" }]);
   expect(restoreDurableQueuedInputs(listener, undefined, [])).toBe(0);
   expect(runtime.queueRuntime.length).toBe(0);
@@ -338,87 +355,6 @@ test("a teleport continuation is not suppressed by a colliding client message id
   );
   expect(processIncomingMessage).toHaveBeenCalledTimes(1);
   expect(listener.acceptedInputDispositionLedger.entries.size).toBe(2);
-});
-
-test("a throwing status callback rejects then recovers the same id exactly once", async () => {
-  const listener = createRuntime();
-  setActiveRuntime(listener);
-  const runtime = getOrCreateScopedRuntime(
-    listener,
-    "agent-1",
-    "conversation-1",
-  );
-  let throwStatus = true;
-  const options: StartListenerOptions = {
-    ...makeOptions(),
-    onStatusChange: () => {
-      if (throwStatus) {
-        throwStatus = false;
-        throw new Error("hostile status callback");
-      }
-    },
-  };
-  const acknowledgements: Array<{
-    accepted: boolean;
-    disposition?: "started" | "queued";
-    duplicate?: boolean;
-    mayRecreateOwner?: () => boolean;
-  }> = [];
-  const trackListenerError = mock(() => {});
-  const processIncomingMessage = mock(async () => {});
-  const dispatch = (): void =>
-    dispatchInboundMessageWhenReady({
-      listener,
-      runtime,
-      incoming: incoming("cm-status-boom"),
-      socket: {
-        kind: "local",
-        bufferedAmount: 0,
-        isOpen: () => true,
-        send: () => {},
-      },
-      options,
-      processQueuedTurn: async () => {},
-      processIncomingMessage,
-      trackListenerError,
-      onInputAccepted: (ack) => acknowledgements.push(ack),
-    });
-
-  dispatch();
-  await runtime.messageQueue;
-  expect(trackListenerError).toHaveBeenCalledTimes(1);
-  expect(acknowledgements).toEqual([{ accepted: false }]);
-  expect(processIncomingMessage).not.toHaveBeenCalled();
-  expect(
-    getInputDisposition(runtime, ordinaryInputIdentity("cm-status-boom")),
-  ).toBeUndefined();
-  expect(listener.acceptedInputDispositionLedger.entries.size).toBe(0);
-  expect(listener.acceptedInputDispositionLedger.scopeCounts.size).toBe(0);
-
-  dispatch();
-  await runtime.messageQueue;
-  expect(acknowledgements).toEqual([
-    { accepted: false },
-    { accepted: true, disposition: "started" },
-  ]);
-  expect(processIncomingMessage).toHaveBeenCalledTimes(1);
-  expect(
-    getInputDisposition(runtime, ordinaryInputIdentity("cm-status-boom")),
-  ).toBe("started");
-
-  dispatch();
-  await runtime.messageQueue;
-  expect(processIncomingMessage).toHaveBeenCalledTimes(1);
-  expect(acknowledgements.at(-1)).toEqual({
-    accepted: true,
-    disposition: "started",
-    duplicate: true,
-    mayRecreateOwner: expect.any(Function),
-  });
-  expect(listener.acceptedInputDispositionLedger.entries.size).toBe(1);
-  expect(
-    listener.acceptedInputDispositionLedger.scopeCounts.get(runtime.key),
-  ).toBe(1);
 });
 
 test("a queued stable ID survives a throwing status callback without replay", async () => {
@@ -628,3 +564,84 @@ test("a teleport admission that throws after admission releases its reservation"
   );
   expect(processIncomingMessage).toHaveBeenCalledTimes(1);
 });
+
+for (const [kind, frame] of [
+  ["message", createMessageFrame],
+  ["teleport", teleportContinueFrame],
+] as const) {
+  test(`${kind} rejection reports the durable store error`, async () => {
+    const directory = mkdtempSync(join(tmpdir(), "input-admission-"));
+    try {
+      const path = join(directory, "ledger.json");
+      writeFileSync(path, "");
+      truncateSync(path, MAX_INPUT_DISPOSITION_STORE_BYTES + 1);
+      const listener = createRuntime();
+      listener.acceptedInputDispositionLedger =
+        createAcceptedInputDispositionLedger({ persistentPath: path });
+      const runtime = getOrCreateScopedRuntime(
+        listener,
+        "agent-1",
+        "conversation-1",
+      );
+      const sent: unknown[] = [];
+      const processIncomingMessage = mock(async () => {});
+      const handleMessage = setupRouter({
+        listener,
+        runtime,
+        sent,
+        tasks: [],
+        trackListenerError: () => {},
+        processIncomingMessage,
+      });
+
+      await handleMessage(frame("store-error", "input-1"));
+
+      expect(sent).toContainEqual(
+        expect.objectContaining({
+          request_id: "store-error",
+          accepted: false,
+          error:
+            "Input ledger unavailable: Accepted-input disposition store exceeds its size limit",
+        }),
+      );
+      expect(JSON.stringify(sent)).not.toContain("at capacity");
+      expect(processIncomingMessage).not.toHaveBeenCalled();
+      expect(runtime.queueRuntime.length).toBe(0);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  });
+
+  test(`${kind} held reservation still reports capacity`, async () => {
+    const listener = createRuntime();
+    const runtime = getOrCreateScopedRuntime(
+      listener,
+      "agent-1",
+      "conversation-1",
+    );
+    const identity =
+      kind === "message"
+        ? ordinaryInputIdentity("input-1")
+        : teleportInputIdentity("input-1");
+    expect(reserveInputDisposition(runtime, identity).kind).toBe("reserved");
+    const sent: unknown[] = [];
+    const handleMessage = setupRouter({
+      listener,
+      runtime,
+      sent,
+      tasks: [],
+      trackListenerError: () => {},
+      processIncomingMessage: async () => {},
+    });
+
+    await handleMessage(frame("held", "input-1"));
+
+    expect(sent).toContainEqual(
+      expect.objectContaining({
+        request_id: "held",
+        accepted: false,
+        error: "Stable input ledger is at capacity",
+      }),
+    );
+  });
+}

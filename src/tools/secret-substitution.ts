@@ -8,6 +8,7 @@ import { peekOrgAccessToken } from "@/auth/org-credentials-session";
 import { getMcpScopeAgentId, lookupParentAgent } from "@/mcp-scope";
 import { settingsManager } from "@/settings-manager";
 import { ensureSecretsLoaded, loadSecrets } from "@/utils/secrets-store";
+import { ensureVariablesLoaded, loadVariables } from "@/utils/variables-store";
 
 /**
  * Pattern to match $SECRET_NAME references where SECRET_NAME is uppercase with
@@ -100,6 +101,74 @@ export async function resolveSecretEnvFromCommand(
     // Unresolvable parent linkage never widens access; keep own secrets only.
     return own;
   }
+}
+
+/** Keep shell environment values separate from the secret redaction snapshot. */
+export async function resolveShellEnvironment(
+  command: unknown,
+  agentId?: string,
+): Promise<{
+  secretEnv: Record<string, string>;
+  variableEnv: Record<string, string>;
+}> {
+  if (
+    typeof command !== "string" &&
+    !(
+      Array.isArray(command) &&
+      command.every((part) => typeof part === "string")
+    )
+  )
+    return { secretEnv: {}, variableEnv: {} };
+  return {
+    secretEnv: await resolveSecretEnvFromCommand(command, agentId),
+    variableEnv: await resolveVariableEnvFromCommand(command, agentId),
+  };
+}
+
+/** Resolve plain values using the same parent scope as vault secrets. */
+export async function resolveVariableEnvFromCommand(
+  command: string | readonly string[],
+  agentId?: string,
+): Promise<Record<string, string>> {
+  const parts = typeof command === "string" ? [command] : command;
+  if (!parts.some((part) => [...part.matchAll(SECRET_PATTERN)].length > 0))
+    return {};
+  try {
+    await ensureVariablesLoaded(agentId);
+  } catch {
+    // Discovery must not prevent ordinary shell commands or secrets from working.
+    // A failed refresh preserves any variables already cached for this scope.
+  }
+  let values: Record<string, string>;
+  try {
+    values = loadVariables(agentId);
+  } catch {
+    return {};
+  }
+  if (agentId) {
+    try {
+      const parent = await getMcpScopeAgentId(
+        agentId,
+        undefined,
+        cachedLookupParentAgent,
+      );
+      if (parent !== agentId) {
+        await ensureVariablesLoaded(parent);
+        values = { ...loadVariables(parent), ...values };
+      }
+    } catch {
+      /* Keep own scope when parent lookup fails. */
+    }
+  }
+  const env: Record<string, string> = {};
+  for (const part of typeof command === "string" ? [command] : command) {
+    for (const match of part.matchAll(SECRET_PATTERN)) {
+      const key = match[1];
+      if (key !== undefined && values[key] !== undefined)
+        env[key] = values[key];
+    }
+  }
+  return env;
 }
 
 /**
@@ -256,15 +325,49 @@ function scrubWithEntries(
   input: string,
   entries: ReadonlyArray<readonly [string, string]>,
 ): string {
+  // A value with quotes, backslashes, or newlines (a PEM key, a JSON blob)
+  // appears escaped inside JSON text such as serialized tool arguments; match
+  // that form too.
+  const forms = entries.flatMap(([name, value]) => {
+    const escaped = JSON.stringify(value).slice(1, -1);
+    return escaped === value
+      ? [[name, value] as const]
+      : [[name, value] as const, [name, escaped] as const];
+  });
   let result = input;
   // Replace longer values first to avoid partial matches
-  const sorted = [...entries].sort(([, a], [, b]) => b.length - a.length);
-  for (const [name, value] of sorted) {
+  forms.sort(([, a], [, b]) => b.length - a.length);
+  for (const [name, value] of forms) {
     if (value.length > 0) {
       result = result.replaceAll(value, `${name}=<REDACTED>`);
     }
   }
   return result;
+}
+
+/**
+ * Scrub secret values from every string in a JSON-like value (objects,
+ * arrays, strings), before it is serialized. Scrubbing a serialized form
+ * instead can miss values that JSON escapes. `secrets` is used as given;
+ * pass {@link captureSecretRedactions} output to include ambient values.
+ */
+export function scrubSecretsDeep<T>(
+  value: T,
+  secrets: Readonly<Record<string, string>>,
+): T {
+  const entries = Object.entries(secrets);
+  if (entries.length === 0) return value;
+  const walk = (node: unknown): unknown => {
+    if (typeof node === "string") return scrubWithEntries(node, entries);
+    if (Array.isArray(node)) return node.map(walk);
+    if (node && typeof node === "object") {
+      return Object.fromEntries(
+        Object.entries(node).map(([key, child]) => [key, walk(child)]),
+      );
+    }
+    return node;
+  };
+  return walk(value) as T;
 }
 
 /**

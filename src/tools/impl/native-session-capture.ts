@@ -14,6 +14,12 @@ import { ApiRequestError, apiRequest } from "@/backend/api/request";
 import { getServerUrl, isCloudServerUrl } from "@/backend/api/server-url";
 import { debugWarn } from "@/utils/debug";
 
+import {
+  clearNativeSessionOwnersForTests,
+  persistNativeSessionOwner,
+  readNativeSessionOwner,
+} from "./native-session-owner";
+
 export type NativeSessionSource = "claude_code" | "codex";
 export interface NativeSessionScope {
   agentId: string;
@@ -812,6 +818,22 @@ export async function awaitNativeSessionCaptureDrainForTests(
   }
 }
 
+// The parent conversation that launched each native session. Unlike the
+// capture state, this is kept for every server: remote steering and resume
+// check it once the launch's background task and subagent row are evicted.
+const MAX_NATIVE_SESSION_OWNERS = 1024;
+const owners = new Map<string, NativeSessionScope>();
+
+export function getNativeSessionOwner(
+  source: NativeSessionSource,
+  sessionId: string,
+): NativeSessionScope | undefined {
+  return (
+    owners.get(key(source, sessionId)) ??
+    readNativeSessionOwner(source, sessionId)
+  );
+}
+
 export function rememberNativeSession(
   source: NativeSessionSource,
   sessionId: string,
@@ -820,6 +842,14 @@ export function rememberNativeSession(
 ): void {
   scavengeStaleSpoolDirectories();
   const id = key(source, sessionId);
+  if (!owners.has(id)) {
+    persistNativeSessionOwner(source, sessionId, scope);
+    owners.set(id, readNativeSessionOwner(source, sessionId) ?? { ...scope });
+    if (owners.size > MAX_NATIVE_SESSION_OWNERS) {
+      const oldest = owners.keys().next().value;
+      if (oldest !== undefined) owners.delete(oldest);
+    }
+  }
   if (!states.has(id) && UUID.test(sessionId) && isCloudServerUrl(cloudUrl))
     states.set(id, {
       scope: { ...scope },
@@ -840,6 +870,8 @@ export async function clearNativeSessionCaptureForTests(): Promise<void> {
   drainHookForTests = undefined;
   const captured = [...states.values()];
   states.clear();
+  owners.clear();
+  clearNativeSessionOwnersForTests();
   for (const admission of admissions.values()) admission.release();
   admissions.clear();
   for (const state of captured) {

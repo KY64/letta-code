@@ -12,10 +12,17 @@ import type {
 } from "@letta-ai/letta-client/resources/agents/messages";
 import type { MessageCreateParams as ConversationMessageCreateParams } from "@letta-ai/letta-client/resources/conversations/messages";
 import { ACTING_USER_ID_ENV, ACTING_USER_ID_HEADER } from "@/agent/acting-user";
+import { getMcpOriginatorToken } from "@/agent/mcp-originator-tokens";
 import type { SkillSource } from "@/agent/skill-sources";
 import { type Backend, getBackend } from "@/backend";
 import { takePendingDiskSpaceReminder } from "@/reminders/disk-space";
 import { getRuntimeContext } from "@/runtime-context";
+import {
+  getBusyRecoveryHttpStatus,
+  markBusyRequest,
+  reportBusyRecovery,
+  traceBusyRecoveryStream,
+} from "@/telemetry/busy-recovery";
 import { trackBoundaryError } from "@/telemetry/error-reporting";
 import {
   type ClientTool,
@@ -45,12 +52,20 @@ import {
   buildClientSkillsUpdateReminder,
 } from "./client-skills";
 import { getSkillSources } from "./context";
-import { parseRetryAfterHeaderMs } from "./turn-recovery-policy";
+import {
+  extractConflictDetail,
+  extractConversationBusyRunId,
+  isConversationBusyError,
+  parseRetryAfterHeaderMs,
+} from "./turn-recovery-policy";
 
 const streamRequestStartTimes = new WeakMap<object, number>();
 const streamToolContextIds = new WeakMap<object, string>();
 const RESPONSE_STATE_HEADER = "X-Letta-Response-State";
 const RESPONSE_STATE_CACHE_SCOPE = "approval_boundary";
+const MCP_ORIGINATOR_TOKEN_HEADER = "x-letta-mcp-originator-token";
+const MCP_ORIGINATOR_ISOLATION_HEADER = "x-letta-mcp-originator-isolation";
+const MCP_ORIGINATOR_SUPER_RUN_HEADER = "x-letta-mcp-originator-super-run-id";
 const CLOUD_API_SHUTDOWN_MAX_RETRIES = 3;
 const CLOUD_API_SHUTDOWN_DEFAULT_RETRY_DELAY_MS = 1000;
 const responseStateIdsByScope = new Map<string, string>();
@@ -499,6 +514,8 @@ export async function sendMessageStreamWithBackend(
     clientSkills,
   );
 
+  reportAttachedRepositorySkillErrors(clientSkillDiscoveryErrors);
+
   if (isDebugEnabled()) {
     debugLog(
       "agent-message",
@@ -560,6 +577,23 @@ export async function sendMessageStreamWithBackend(
   // SendMessageStreamOptions.actingUserId for full context.
   if (actingUserId) {
     extraHeaders[ACTING_USER_ID_HEADER] = actingUserId;
+  }
+  // Client-side tools continue the same chat turn through a new Messages API
+  // request. Forward the server-minted originator proof held for that turn so
+  // private MCP authorization survives the continuation without treating the
+  // listener's API key as the human who started it. The bearer remains
+  // process-local: it is never copied into message bodies, tool arguments, or
+  // transcripts, and headerless turns keep their existing behavior.
+  // A prepared tool context is an authority boundary. Its explicit null must
+  // not fall back to an outer AsyncLocalStorage turn's originator.
+  const originatorSuperRunId = executionRuntimeContext
+    ? executionRuntimeContext.mcpOriginatorSuperRunId
+    : getRuntimeContext()?.mcpOriginatorSuperRunId;
+  const originatorToken = getMcpOriginatorToken(originatorSuperRunId);
+  if (originatorToken && originatorSuperRunId) {
+    extraHeaders[MCP_ORIGINATOR_TOKEN_HEADER] = originatorToken;
+    extraHeaders[MCP_ORIGINATOR_ISOLATION_HEADER] = "1";
+    extraHeaders[MCP_ORIGINATOR_SUPER_RUN_HEADER] = originatorSuperRunId;
   }
 
   const messageSummary = normalizedMessages
@@ -649,6 +683,16 @@ export async function sendMessageStreamWithBackend(
       }
 
       abortRelay?.cleanup();
+      const detail = extractConflictDetail(error);
+      if (isConversationBusyError(detail)) {
+        markBusyRequest(backend, resolvedConversationId, firstOtid);
+        reportBusyRecovery("send_rejected", {
+          conversationId: resolvedConversationId,
+          otid: firstOtid,
+          blockerRunId: extractConversationBusyRunId(detail) ?? undefined,
+          httpStatus: getBusyRecoveryHttpStatus(error),
+        });
+      }
       debugWarn(
         "send-message-stream",
         "request_error conversation_id=%s otid=%s status=%s error=%s",
@@ -668,6 +712,13 @@ export async function sendMessageStreamWithBackend(
     firstOtid ?? "none",
   );
 
+  stream = traceBusyRecoveryStream(
+    stream,
+    resolvedConversationId,
+    firstOtid,
+    requestOptions.signal,
+    backend,
+  );
   abortRelay?.attach(stream as object);
 
   if (requestStartTime !== undefined) {
@@ -684,4 +735,23 @@ export async function sendMessageStreamWithBackend(
   });
 
   return stream;
+}
+
+/**
+ * Attached-repository resolution failures (e.g. the repository list fetch)
+ * change which skills reach the prompt, so surface them beyond debug logs.
+ * Only `shared-memory:` errors are reported: they carry server error messages
+ * and opaque ids, not local filesystem paths from project skill parsing.
+ */
+function reportAttachedRepositorySkillErrors(
+  errors: ReadonlyArray<{ path: string; message: string }>,
+): void {
+  for (const error of errors) {
+    if (!error.path.startsWith("shared-memory:")) continue;
+    trackBoundaryError({
+      errorType: "client_skills_attached_repositories_error",
+      error: error.message,
+      context: "send_message_client_skills",
+    });
+  }
 }

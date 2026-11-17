@@ -25,6 +25,7 @@ import { shouldEmitRetryNotice } from "@/utils/cloud-api-shutdown";
 import { isDebugEnabled } from "@/utils/debug";
 import { createStreamAbortRelay } from "@/utils/stream-abort-relay";
 import {
+  clearPendingApprovalBatchIds,
   rememberPendingApprovalBatchIds,
   resolveRecoveryBatchId,
 } from "./approval";
@@ -34,6 +35,7 @@ import {
   MAX_PRE_STREAM_RECOVERY,
 } from "./constants";
 import { getConversationWorkingDirectory } from "./cwd";
+import { captureNotificationWait } from "./external-tools";
 import { readInterruptedTurn } from "./interrupted-turn-read";
 import {
   createListenerAgentModContext,
@@ -43,9 +45,14 @@ import {
 import { getOrCreateConversationPermissionModeStateRef } from "./permission-mode";
 import { emitRetryDelta } from "./protocol-outbound";
 import {
+  allRecordedResults,
+  recordedToolResults,
+} from "./recorded-tool-results";
+import {
   drainRecoveryStreamWithEmission,
   isApprovalToolCallDesyncError,
 } from "./recovery";
+import { retryApprovalRecoveryRead } from "./recovery-read";
 import { injectQueuedSkillContent } from "./skill-injection";
 import type { ListenerTransport } from "./transport";
 import type { TurnCorrelation } from "./turn-correlation";
@@ -276,9 +283,12 @@ async function tryResumeBusyConversationStream(params: {
 }
 
 /**
- * Attempt to resolve stale pending approvals by fetching them from the backend
- * and auto-denying. This is the Phase 3 bounded recovery mechanism — it does NOT
- * touch pendingInterruptedResults (that's exclusively owned by handleIncomingMessage).
+ * Attempt to resolve stale pending approvals by fetching them from the backend.
+ * Calls whose result was already checkpointed in the interrupted-turn record are
+ * resolved with that result; only calls with no recorded result are auto-denied.
+ * This is the Phase 3 bounded recovery mechanism. Reusing recorded results also
+ * drops any parked pendingInterruptedResults, as recover-recorded-turn does, so
+ * stale denials for the same calls are not sent afterward.
  */
 export async function resolveStaleApprovals(
   runtime: ConversationRuntime,
@@ -294,11 +304,16 @@ export async function resolveStaleApprovals(
     sendApprovalContinuation?: typeof sendApprovalContinuationWithRetry;
     drainRecoveryStream?: typeof drainRecoveryStreamWithEmission;
     authorityGuard?: () => boolean;
+    readInterruptedTurn?: typeof readInterruptedTurn;
   } = {},
 ): Promise<Awaited<ReturnType<typeof drainRecoveryStreamWithEmission>> | null> {
   if (!runtime.agentId && runtime.conversationId === "default") return null;
-
-  const getResumeDataImpl = deps.getResumeData ?? getResumeDataFromBackend;
+  const getResumeDataImpl: typeof getResumeDataFromBackend = (...args) =>
+    retryApprovalRecoveryRead(
+      () => (deps.getResumeData ?? getResumeDataFromBackend)(...args),
+      assertCurrentTurnLease,
+      turnLease.signal,
+    );
   const prepareToolExecutionContext =
     deps.prepareToolExecutionContext ?? prepareToolExecutionContextForScope;
   const sendApprovalContinuation =
@@ -314,16 +329,22 @@ export async function resolveStaleApprovals(
       throw new Error("Cancelled by user");
     }
   };
-
   assertCurrentTurnLease();
   const backend = getBackend();
   let agent: Awaited<ReturnType<typeof backend.retrieveAgent>>;
   try {
-    agent = await retrieveResumeState(runtime.agentId, runtime.conversationId, {
-      retrieveAgent: deps.retrieveAgent ?? backend.retrieveAgent.bind(backend),
-      retrieveConversation:
-        deps.retrieveConversation ?? backend.retrieveConversation.bind(backend),
-    });
+    agent = await retryApprovalRecoveryRead(
+      () =>
+        retrieveResumeState(runtime.agentId, runtime.conversationId, {
+          retrieveAgent:
+            deps.retrieveAgent ?? backend.retrieveAgent.bind(backend),
+          retrieveConversation:
+            deps.retrieveConversation ??
+            backend.retrieveConversation.bind(backend),
+        }),
+      assertCurrentTurnLease,
+      turnLease.signal,
+    );
   } catch (err) {
     assertCurrentTurnLease();
     if (isBackendNotFoundError(err)) {
@@ -334,7 +355,6 @@ export async function resolveStaleApprovals(
   assertCurrentTurnLease();
   const requestedConversationId =
     runtime.conversationId !== "default" ? runtime.conversationId : undefined;
-
   let resumeData: Awaited<ReturnType<typeof getResumeDataFromBackend>>;
   try {
     resumeData = await getResumeDataImpl(agent, requestedConversationId, {
@@ -349,10 +369,22 @@ export async function resolveStaleApprovals(
     throw err;
   }
   assertCurrentTurnLease();
-
   let pendingApprovals = resumeData.pendingApprovals || [];
   if (pendingApprovals.length === 0) return null;
-
+  // Another client may resolve these calls while we prepare or send the
+  // denial; re-read the server and keep only the calls still pending.
+  const filterStillPending = async (approvals: typeof pendingApprovals) => {
+    const fresh = await getResumeDataImpl(agent, requestedConversationId, {
+      includeMessageHistory: false,
+      throwOnReadError: true,
+    }).catch((err: unknown) => {
+      if (isBackendNotFoundError(err)) return null;
+      throw err;
+    });
+    assertCurrentTurnLease();
+    const ids = new Set(fresh?.pendingApprovals?.map((a) => a.toolCallId));
+    return approvals.filter((a) => ids.has(a.toolCallId));
+  };
   const recoveryConversationId = runtime.conversationId;
   const recoveryWorkingDirectory =
     runtime.activeWorkingDirectory ??
@@ -386,6 +418,7 @@ export async function resolveStaleApprovals(
       ? { modContext: createListenerAgentModContext(runtime.agentId) }
       : {}),
     modAdapters,
+    shouldEnqueueBackground: captureNotificationWait(runtime.listener, scope),
     modEvents: createListenerModEvents(modAdapters),
   });
   assertCurrentTurnLease();
@@ -393,8 +426,11 @@ export async function resolveStaleApprovals(
   runtime.currentToolsetPreference = preparedToolContext.toolsetPreference;
   runtime.currentLoadedTools =
     preparedToolContext.preparedToolContext.loadedToolNames;
-  const recoveryActingUserId = readInterruptedTurn(runtime)?.actingUserId;
-
+  const recoveryRecord = (deps.readInterruptedTurn ?? readInterruptedTurn)(
+    runtime,
+  );
+  const recoveryActingUserId = recoveryRecord?.actingUserId;
+  pendingApprovals = await filterStillPending(pendingApprovals);
   while (pendingApprovals.length > 0) {
     assertCurrentTurnLease();
     const recoveryBatchId = resolveRecoveryBatchId(runtime, pendingApprovals);
@@ -404,15 +440,31 @@ export async function resolveStaleApprovals(
       );
     }
     rememberPendingApprovalBatchIds(runtime, pendingApprovals, recoveryBatchId);
-
-    const approvalResults = buildFreshDenialApprovals(
-      pendingApprovals,
-      STALE_APPROVAL_RECOVERY_DENIAL_REASON,
+    // A call may have executed before its continuation was lost. Send its
+    // checkpointed result instead of claiming no result was recorded.
+    const pendingToolCallIds = pendingApprovals.map(
+      (approval) => approval.toolCallId,
     );
+    const approvalResults = recoveryRecord
+      ? recordedToolResults(recoveryRecord, pendingToolCallIds)
+      : buildFreshDenialApprovals(
+          pendingApprovals,
+          STALE_APPROVAL_RECOVERY_DENIAL_REASON,
+        );
     if (approvalResults.length === 0) {
       return null;
     }
-
+    if (
+      recoveryRecord &&
+      allRecordedResults(recoveryRecord).some((result) =>
+        pendingToolCallIds.includes(result.tool_call_id),
+      )
+    ) {
+      // These saved results replace any parked stale denials for the batch.
+      runtime.pendingInterruptedResults = null;
+      runtime.pendingInterruptedContext = null;
+      runtime.pendingInterruptedToolCallIds = null;
+    }
     try {
       const continuationInput = createTurnInputState([
         {
@@ -422,7 +474,6 @@ export async function resolveStaleApprovals(
         },
       ]);
       let recoveryTurnCorrelation: TurnCorrelation | undefined;
-
       const continuationMessagesWithSkillContent = injectQueuedSkillContent(
         continuationInput.messages,
         {
@@ -456,17 +507,26 @@ export async function resolveStaleApprovals(
           allowApprovalRecovery: false,
           authorityGuard: deps.authorityGuard,
         },
-      );
+      ).catch(async (sendError: unknown) => {
+        // If the server rejected the denial because nothing is pending
+        // anymore, recovery is done; otherwise surface the original error.
+        assertCurrentTurnLease();
+        const stillPending = await filterStillPending(pendingApprovals).catch(
+          () => null,
+        );
+        assertCurrentTurnLease();
+        if (stillPending?.length === 0) return null;
+        throw sendError;
+      });
       assertCurrentTurnLease();
+      if (recoverySendResult === null) return null;
       if (recoverySendResult.kind !== "stream") {
         throw new Error(
           "Approval recovery send resolved without a continuation stream",
         );
       }
       const recoveryStream = recoverySendResult.stream;
-
       setTurnLoopStatus(runtime, turnLease, "PROCESSING_API_RESPONSE", scope);
-
       const drainResult = await drainRecoveryStream(
         recoveryStream as Stream<LettaStreamingResponse>,
         socket,
@@ -480,22 +540,22 @@ export async function resolveStaleApprovals(
         },
       );
       assertCurrentTurnLease();
-
       if (drainResult.stopReason === "error") {
         throw new Error("Pre-stream approval recovery drain ended with error");
       }
       if (drainResult.stopReason !== "requires_approval") {
         return drainResult;
       }
+      // This round is resolved; drop its batch mapping so the next round's
+      // approvals get their own batch instead of looking ambiguous.
+      clearPendingApprovalBatchIds(runtime, pendingApprovals);
       pendingApprovals = drainResult.approvals || [];
     } finally {
       runtime.turnLifecycle.setExecutingToolCallIds(turnLease, []);
     }
   }
-
   return null;
 }
-
 /**
  * Wrap sendMessageStream with pre-stream error handling (retry/recovery).
  * Mirrors headless bidirectional mode's pre-stream error handling.

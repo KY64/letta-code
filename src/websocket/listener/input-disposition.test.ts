@@ -79,7 +79,10 @@ test("completed input replay survives idle runtime eviction", async () => {
     "agent-1",
     "conversation-1",
   );
-  const processIncomingMessage = mock(async () => {});
+  const processQueuedTurn = mock(async () => {
+    firstRuntime.dequeuedInputIdentitiesByBatchId.clear();
+    firstRuntime.dequeuedClientMessageIdsByBatchId.clear();
+  });
   const acknowledgements: Array<{
     accepted: boolean;
     disposition?: "started" | "queued";
@@ -98,11 +101,12 @@ test("completed input replay survives idle runtime eviction", async () => {
       send: () => {},
     },
     options,
-    processQueuedTurn: async () => {},
-    processIncomingMessage,
+    processQueuedTurn,
+    processIncomingMessage: async () => {},
     trackListenerError: () => {},
     onInputAccepted: (ack) => acknowledgements.push(ack),
   });
+  await firstRuntime.messageQueue;
   await firstRuntime.messageQueue;
   expect(
     getConversationRuntime(listener, "agent-1", "conversation-1"),
@@ -124,16 +128,16 @@ test("completed input replay survives idle runtime eviction", async () => {
       send: () => {},
     },
     options,
-    processQueuedTurn: async () => {},
-    processIncomingMessage,
+    processQueuedTurn,
+    processIncomingMessage: async () => {},
     trackListenerError: () => {},
     onInputAccepted: (ack) => acknowledgements.push(ack),
   });
   await replacementRuntime.messageQueue;
 
-  expect(processIncomingMessage).toHaveBeenCalledTimes(1);
+  expect(processQueuedTurn).toHaveBeenCalledTimes(1);
   expect(acknowledgements).toEqual([
-    { accepted: true, disposition: "started" },
+    { accepted: true, disposition: "queued" },
     // The duplicate re-ack carries the live-owner proof the originator
     // token store needs before recreating a lost entry.
     {
@@ -172,23 +176,24 @@ test("accepted tombstone transfers only through explicit listener replacement", 
     getInputDisposition(unrelatedRuntime, ordinaryInputIdentity("ack-lost")),
   ).toBeUndefined();
   expect(() =>
-    adoptListenerClientReplacement(unrelated, {
+    adoptListenerClientReplacement({
       ...options,
       connectionName: "other-account-lineage",
       replacement,
     }),
   ).toThrow("Invalid listener replacement lineage");
   expect(() =>
-    adoptListenerClientReplacement(unrelated, {
+    adoptListenerClientReplacement({
       ...options,
       replacement: { ...replacement },
     }),
   ).toThrow("Invalid listener replacement lineage");
 
-  const next = createRuntime();
-  adoptListenerClientReplacement(next, { ...options, replacement });
+  const next = adoptListenerClientReplacement({ ...options, replacement });
+  expect(next).toBe(original);
+  if (!next) throw new Error("runtime missing");
   expect(() =>
-    adoptListenerClientReplacement(createRuntime(), {
+    adoptListenerClientReplacement({
       ...options,
       replacement,
     }),
@@ -931,7 +936,10 @@ test("corrupt durable store fails closed and is never overwritten", () => {
     const runtime = persistentRuntime(path);
     expect(
       reserveInputDisposition(runtime, ordinaryInputIdentity("cm-corrupt")),
-    ).toEqual({ kind: "full" });
+    ).toEqual({
+      kind: "full",
+      reason: expect.stringContaining("Input ledger unavailable: "),
+    });
     expect(() => restoreDurableQueuedInputs(runtime.listener)).toThrow();
     expect(readFileSync(path, "utf8")).toBe("{corrupt");
   } finally {
@@ -949,7 +957,7 @@ test("durability failure rejects admission without an in-memory tombstone", () =
     mkdirSync(directoryAsStore);
     expect(
       reserveInputDisposition(runtime, ordinaryInputIdentity("cm-failure")),
-    ).toEqual({ kind: "full" });
+    ).toEqual({ kind: "full", reason: expect.stringContaining("EISDIR") });
     expect(runtime.listener.acceptedInputDispositionLedger.entries.size).toBe(
       0,
     );

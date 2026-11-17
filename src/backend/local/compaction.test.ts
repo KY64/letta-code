@@ -58,6 +58,7 @@ describe("local compaction summarizer options", () => {
 
       expect(capturedOptions?.sessionId).toBe("conv-opencode-compaction");
       expect(capturedOptions?.headers).toEqual({
+        "x-letta-request-kind": "compaction",
         "x-opencode-session": "conv-opencode-compaction",
       });
     } finally {
@@ -122,7 +123,8 @@ describe("local compaction summarizer options", () => {
       // the session thinking level. Without options.reasoning, pi-ai sends
       // `thinking: {type: "disabled"}`, which adaptive-thinking Anthropic
       // models (claude-fable-5) reject with a 400 invalid_request_error.
-      expect(capturedOptions?.reasoning).toBe("xhigh");
+      // The Opus summary model supports max, so preserve the session effort.
+      expect(capturedOptions?.reasoning).toBe("max");
     } finally {
       await rm(storageDir, { recursive: true, force: true });
     }

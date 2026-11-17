@@ -1,6 +1,7 @@
 import { getConversationId, getCurrentAgentId } from "@/agent/context";
 import { SYSTEM_REMINDER_OPEN } from "@/constants";
 import { getRuntimeContext } from "@/runtime-context";
+import type { QueuedMessage } from "@/utils/message-queue-bridge";
 import { subagentScopeMatches } from "@/utils/subagent-scope";
 
 /**
@@ -18,11 +19,13 @@ export interface NotificationScope {
   agentId: string;
   conversationId: string;
   actingUserId?: string | null;
+  /** Client message ids of the listener turn that started the work. */
+  clientMessageIds?: string[];
 }
 
 export interface TaskNotification {
   taskId: string;
-  status: "completed" | "failed";
+  status: "completed" | "failed" | "running";
   summary: string;
   result: string;
   outputFile?: string;
@@ -70,11 +73,15 @@ export function resolveNotificationScope(parentScope?: {
   const actingUserId = runtime?.suppressActingUserFallback
     ? null
     : runtime?.actingUserId;
+  // Lets the notification turn join the send that started this work.
+  const clientMessageIds = runtime?.resolveClientMessageIds?.() ?? [];
+  const correlation = clientMessageIds.length > 0 ? { clientMessageIds } : {};
   if (parentScope?.agentId) {
     return {
       agentId: parentScope.agentId,
       conversationId: parentScope.conversationId || "default",
       actingUserId,
+      ...correlation,
     };
   }
 
@@ -83,6 +90,7 @@ export function resolveNotificationScope(parentScope?: {
       agentId: getCurrentAgentId(),
       conversationId: getConversationId() ?? "default",
       actingUserId,
+      ...correlation,
     };
   } catch {
     return undefined;
@@ -117,6 +125,26 @@ export function formatTaskNotification(notification: TaskNotification): string {
 <summary>${escapedSummary}</summary>
 <result>${escapedResult}</result>${usageBlock}
 </task-notification>${notification.outputFile ? `\nFull transcript available at: ${notification.outputFile}` : ""}`;
+}
+
+/** Optional deployment-owned guidance for subagent receipts and results. */
+export function subagentResultReminder(): string {
+  const reminder = process.env.LETTA_SUBAGENT_RESULT_REMINDER;
+  return reminder
+    ? `\n\n<system-reminder>\n${reminder}\n</system-reminder>`
+    : "";
+}
+
+/** Preserve the display text while sending the XML and transcript as separate parts. */
+export function taskNotificationMessage(
+  text: string,
+): Pick<QueuedMessage, "text" | "content"> {
+  const parts = text
+    .split(/(?<=<\/task-notification>)\n(?=Full transcript available at:)/)
+    .map((part) => ({ type: "text" as const, text: part }));
+  const reminder = subagentResultReminder();
+  if (reminder) parts.push({ type: "text", text: reminder.trimStart() });
+  return { text, content: parts };
 }
 
 export function formatMonitorEventNotification(notification: {

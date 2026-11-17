@@ -1,3 +1,4 @@
+import { validateHeaderValue } from "node:http";
 import {
   type Api,
   clampThinkingLevel,
@@ -103,6 +104,33 @@ function alwaysOnZaiThinking(modelId?: string): boolean {
   );
 }
 
+function finiteNumberValue(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : undefined;
+}
+
+/** The agent's sampling settings as pi-ai request options. */
+export function samplingOptionsForSettings(
+  modelSettings: Record<string, unknown>,
+): {
+  samplingParams?: Record<string, unknown>;
+  maxTokens?: number;
+  temperature?: number;
+} {
+  const maxTokens = finiteNumberValue(modelSettings.max_tokens);
+  const temperature = finiteNumberValue(modelSettings.temperature);
+  return {
+    // streamSimple drops provider-specific named options; samplingParams is
+    // pi-ai's supported pass-through for explicit provider request overrides.
+    ...(isRecord(modelSettings.sampling_params)
+      ? { samplingParams: modelSettings.sampling_params }
+      : {}),
+    ...(maxTokens ? { maxTokens } : {}),
+    ...(temperature !== undefined ? { temperature } : {}),
+  };
+}
+
 // Maps Letta model settings to a pi-ai ThinkingLevel. Every pi-ai Anthropic
 // call against a reasoning-capable model must pass this when available:
 // pi-ai sends `thinking: {type: "disabled"}` for reasoning models when
@@ -119,7 +147,8 @@ export function reasoningForSettings(
   const modelId = modelIdFromHandle(modelHandle);
   const preserveMax =
     modelId?.startsWith("gpt-5.6") === true ||
-    modelId?.startsWith("gpt-6") === true;
+    modelId?.startsWith("gpt-6") === true ||
+    model?.thinkingLevelMap?.max === "max";
   const nestedReasoning = isRecord(modelSettings.reasoning)
     ? modelSettings.reasoning
     : undefined;
@@ -581,6 +610,11 @@ export async function resolvePiModelForAgent(
         : authResult?.auth.apiKey,
   };
   if (authResult?.auth.baseUrl) baseURL = authResult.auth.baseUrl;
+  // pi-ai 1.5 moved Kimi Coding to Chat Completions under /coding/v1.
+  // Existing records may pin the former built-in URL; retain custom URLs.
+  if (provider === "kimi-coding" && baseURL === "https://api.kimi.com/coding") {
+    baseURL = publishedModel?.baseUrl;
+  }
   if (authResult?.auth.headers) {
     headers = mergeHeaders(headers, nonNullHeaders(authResult.auth.headers));
   }
@@ -605,6 +639,16 @@ export async function resolvePiModelForAgent(
       timeout: zai.timeout,
     };
     baseURL = zai.baseURL;
+  }
+
+  if (connection.apiKey) {
+    try {
+      validateHeaderValue("Authorization", `Bearer ${connection.apiKey}`);
+    } catch {
+      throw new Error(
+        `API key for ${provider} is not a valid header value. Reconnect this provider with /connect.`,
+      );
+    }
   }
 
   if (provider === "amazon-bedrock") {

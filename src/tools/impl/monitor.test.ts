@@ -10,6 +10,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { WebSocketServer } from "ws";
+import {
+  resolveBackendMode,
+  setConfiguredBackendMode,
+} from "@/backend/backend-mode";
 import { runWithRuntimeContext } from "@/runtime-context";
 import {
   executeTool,
@@ -53,6 +57,7 @@ function outputFileOf(result: Awaited<ReturnType<typeof monitor>>): string {
 }
 
 describe("Monitor", () => {
+  let previousBackendMode = resolveBackendMode();
   let scratchpad: string;
   let previousScratchpad: string | undefined;
   let previousManagedCloud: string | undefined;
@@ -73,6 +78,8 @@ describe("Monitor", () => {
   }
 
   beforeEach(() => {
+    previousBackendMode = resolveBackendMode();
+    setConfiguredBackendMode("local");
     previousManagedCloud = process.env.LETTA_MANAGED_CLOUD_RUNTIME;
     delete process.env.LETTA_MANAGED_CLOUD_RUNTIME;
     previousScratchpad = process.env.LETTA_SCRATCHPAD;
@@ -85,6 +92,7 @@ describe("Monitor", () => {
   });
 
   afterEach(() => {
+    setConfiguredBackendMode(previousBackendMode);
     if (previousManagedCloud === undefined) {
       delete process.env.LETTA_MANAGED_CLOUD_RUNTIME;
     } else {
@@ -115,21 +123,21 @@ describe("Monitor", () => {
   });
 
   test("matches the reference schema defaults and descriptions", () => {
-    expect(MonitorSchema.required).toEqual(["description"]);
+    expect(MonitorSchema.required).toEqual([]);
     expect(MonitorSchema).not.toHaveProperty("oneOf");
     expect(MonitorSchema.properties.description.description).toBe(
-      "Clear, concise user-facing description of the update you are waiting for. This may be shown directly in chat, so make it grammatical by itself. Describe the expected event, not the polling command or monitor implementation. Prefer `CI results and review comments for the auth fix`, `Deployment completion or failure`, or `New errors in the API logs` over internal labels like `PR checks and state transitions`.",
+      "Clear, concise user-facing description of the update you are waiting for. This may be shown directly in chat, so make it grammatical by itself. Describe the expected event, not the polling command or monitor implementation. Prefer `CI results and review comments for the auth fix`, `Deployment completion or failure`, or `New errors in the API logs` over internal labels like `PR checks and state transitions`. Required unless `resume` is set.",
     );
     expect(MonitorSchema.properties.timeout_ms).toMatchObject({
       minimum: 1000,
       default: 300000,
       description:
-        "Kill the monitor after this deadline. Default 300000ms, max 3600000ms. Ignored when persistent is true.",
+        "Kill the monitor after this deadline. Default 300000ms. Maximum {{MONITOR_MAX_TIMEOUT}}. Ignored when persistent is true.",
     });
     expect(MonitorSchema.properties.persistent).toMatchObject({
       default: false,
       description:
-        "Run until TaskStop or session end. In managed Cloud sandboxes, a hard 1-hour limit still applies; elsewhere there is no timeout. For longer waits in Cloud, use Wake/cron rather than keeping a monitor running.",
+        "Run until TaskStop or session end. In managed Cloud sandboxes, it still stops after {{MONITOR_MAX_TIMEOUT}} (this sandbox's monitor cap); elsewhere there is no timeout. Call Monitor again to re-arm it. For much longer waits in Cloud, use Wake/cron.",
     });
     expect(MonitorSchema.properties.ws.properties.protocols).not.toHaveProperty(
       "uniqueItems",
